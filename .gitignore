@@ -1,0 +1,21 @@
+# venv
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.pyc
+
+# dados / modelos grandes
+data/
+*.tar.gz
+*.zip
+*.pt
+*.pth
+*.ckpt
+
+# logs / checkpoints
+runs/
+outputs/
+wandb/
