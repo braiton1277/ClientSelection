@@ -1,23 +1,3 @@
-"""
-FL client selection experiment (CIFAR-10) — RANDOM vs NEURAL CONTEXTUAL BANDIT
-(+ optional METRIC track)
-
-Clients: Dirichlet non-IID split
-Poison: optional label flipping in a subset of clients
-
-State/features per client (bandit/RL state later):
-- prox(i)      = alignment(Δw_i, -g_ref) * tanh(||Δw_i||/c)
-- probeEMA(i)  = EMA of probing loss (global model on client data, few batches)
-- staleness(i) = rounds since last selected
-- streak(i)    = consecutive selections
-- dlossEMA(i)  = EMA of local delta-loss (loss_before_local - loss_after_local over few batches)
-
-Bandit reward per round (per track):
-- reward_round = val_loss_before - val_loss_after (positive is good)
-Credit assignment:
-- each selected client gets reward_round / K
-"""
-
 import copy
 import random
 import time
@@ -31,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 
+#DQN PARA CIFAR10 
 # ============================
 # Logging helper
 # ============================
@@ -155,7 +136,8 @@ def probing_loss(model: nn.Module, loader: DataLoader, batches: int = 2) -> floa
         if b >= batches:
             break
         x, y = x.to(DEVICE), y.to(DEVICE)
-        tot += F.cross_entropy(model(x), y).item()
+        loss = F.cross_entropy(model(x), y)
+        tot += loss.item()
         n += 1
     return tot / max(1, n)
 
@@ -404,7 +386,7 @@ def update_ema(arr_ema: np.ndarray, arr_now: np.ndarray, alpha: float, init_if_z
 
 
 # ============================
-# Metric selection (optional)
+# (Optional) Metric selection
 # ============================
 def select_by_metric_prox_probeEMA_saturating(
     prox: np.ndarray,
@@ -452,93 +434,8 @@ def select_by_metric_prox_probeEMA_saturating(
 
 
 # ============================
-# Neural contextual bandit
+# Context builder (d=6)
 # ============================
-class BanditNet(nn.Module):
-    def __init__(self, d_in: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-class ReplayBuffer:
-    def __init__(self, capacity: int, d_in: int):
-        self.capacity = int(capacity)
-        self.d_in = int(d_in)
-        self.x = np.zeros((capacity, d_in), dtype=np.float32)
-        self.r = np.zeros((capacity,), dtype=np.float32)
-        self.n = 0
-        self.ptr = 0
-
-    def add(self, x: np.ndarray, r: float):
-        self.x[self.ptr] = x.astype(np.float32)
-        self.r[self.ptr] = float(r)
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.n = min(self.n + 1, self.capacity)
-
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
-        bs = min(int(batch_size), self.n)
-        idx = np.random.choice(self.n, size=bs, replace=False)
-        return self.x[idx], self.r[idx]
-
-
-class NeuralContextualBandit:
-    def __init__(
-        self,
-        d_in: int,
-        lr: float = 1e-3,
-        weight_decay: float = 1e-4,
-        buf_size: int = 5000,
-        batch_size: int = 128,
-        train_steps: int = 10,
-        grad_clip: float = 1.0,
-    ):
-        self.d_in = int(d_in)
-        self.batch_size = int(batch_size)
-        self.train_steps = int(train_steps)
-        self.grad_clip = float(grad_clip)
-
-        self.model = BanditNet(d_in).to(DEVICE)
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.buf = ReplayBuffer(buf_size, d_in)
-
-    @torch.no_grad()
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        self.model.eval()
-        xt = torch.tensor(X, dtype=torch.float32, device=DEVICE)
-        y = self.model(xt).detach().cpu().numpy().astype(np.float64)
-        return y
-
-    def add_experience(self, x: np.ndarray, r: float):
-        self.buf.add(x, r)
-
-    def train(self):
-        if self.buf.n < max(64, self.batch_size // 2):
-            return
-        self.model.train()
-        for _ in range(self.train_steps):
-            xb, rb = self.buf.sample(self.batch_size)
-            xt = torch.tensor(xb, dtype=torch.float32, device=DEVICE)
-            rt = torch.tensor(rb, dtype=torch.float32, device=DEVICE)
-
-            pred = self.model(xt)
-            loss = F.mse_loss(pred, rt)
-
-            self.opt.zero_grad()
-            loss.backward()
-            if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            self.opt.step()
-
-
 def build_context_matrix_nn(
     prox: np.ndarray,
     probe_ema: np.ndarray,
@@ -569,30 +466,149 @@ def build_context_matrix_nn(
     return X
 
 
-def select_topk_neural_bandit(
-    bandit: NeuralContextualBandit,
-    X: np.ndarray,
-    k: int,
-    eps: float = 0.10,
-) -> List[int]:
-    n = X.shape[0]
-    if np.random.rand() < eps:
-        return np.random.choice(np.arange(n), size=k, replace=False).tolist()
-    scores = bandit.predict(X)
-    sel = np.argsort(scores)[::-1][:k].tolist()
-    return sel
+# ============================
+# DQN selector (2 actions)
+# ============================
+class QNet(nn.Module):
+    def __init__(self, d_in: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2),  # Q(x,0), Q(x,1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DQNReplay:
+    def __init__(self, capacity: int, d_in: int):
+        self.capacity = int(capacity)
+        self.d_in = int(d_in)
+        self.x  = np.zeros((capacity, d_in), dtype=np.float32)
+        self.a  = np.zeros((capacity,), dtype=np.int64)
+        self.r  = np.zeros((capacity,), dtype=np.float32)
+        self.x2 = np.zeros((capacity, d_in), dtype=np.float32)
+        self.d  = np.zeros((capacity,), dtype=np.float32)
+        self.n = 0
+        self.ptr = 0
+
+    def add(self, x, a, r, x2, done: bool):
+        self.x[self.ptr] = x.astype(np.float32)
+        self.a[self.ptr] = int(a)
+        self.r[self.ptr] = float(r)
+        self.x2[self.ptr] = x2.astype(np.float32)
+        self.d[self.ptr] = 1.0 if done else 0.0
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size: int):
+        bs = min(int(batch_size), self.n)
+        idx = np.random.choice(self.n, size=bs, replace=False)
+        return self.x[idx], self.a[idx], self.r[idx], self.x2[idx], self.d[idx]
+
+
+class DQNSelector:
+    def __init__(
+        self,
+        d_in: int,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        gamma: float = 0.90,
+        buf_size: int = 20000,
+        batch_size: int = 256,
+        train_steps: int = 10,
+        grad_clip: float = 1.0,
+        target_sync_every: int = 10,
+        double_dqn: bool = True,
+    ):
+        self.d_in = int(d_in)
+        self.gamma = float(gamma)
+        self.batch_size = int(batch_size)
+        self.train_steps = int(train_steps)
+        self.grad_clip = float(grad_clip)
+        self.target_sync_every = int(target_sync_every)
+        self.double_dqn = bool(double_dqn)
+
+        self.q = QNet(d_in).to(DEVICE)
+        self.q_tgt = QNet(d_in).to(DEVICE)
+        self.q_tgt.load_state_dict(self.q.state_dict())
+
+        self.opt = torch.optim.Adam(self.q.parameters(), lr=lr, weight_decay=weight_decay)
+        self.buf = DQNReplay(buf_size, d_in)
+        self._train_calls = 0
+
+    @torch.no_grad()
+    def q_values(self, X: np.ndarray) -> np.ndarray:
+        self.q.eval()
+        xt = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        q = self.q(xt).detach().cpu().numpy().astype(np.float64)
+        return q
+
+    def select_topk(self, X: np.ndarray, k: int, eps: float = 0.10) -> List[int]:
+        n = X.shape[0]
+        if np.random.rand() < eps:
+            return np.random.choice(np.arange(n), size=k, replace=False).tolist()
+        q = self.q_values(X)
+        adv = q[:, 1] - q[:, 0]
+        sel = np.argsort(adv)[::-1][:k].tolist()
+        return sel
+
+    def add_transition(self, x, a, r, x2, done: bool):
+        self.buf.add(x, a, r, x2, done)
+
+    def train(self):
+        if self.buf.n < max(256, self.batch_size // 2):
+            return
+
+        self.q.train()
+        for _ in range(self.train_steps):
+            xb, ab, rb, x2b, db = self.buf.sample(self.batch_size)
+
+            x  = torch.tensor(xb,  dtype=torch.float32, device=DEVICE)
+            a  = torch.tensor(ab,  dtype=torch.int64,   device=DEVICE).unsqueeze(1)
+            r  = torch.tensor(rb,  dtype=torch.float32, device=DEVICE)
+            x2 = torch.tensor(x2b, dtype=torch.float32, device=DEVICE)
+            d  = torch.tensor(db,  dtype=torch.float32, device=DEVICE)
+
+            q_all = self.q(x)
+            q_sa  = q_all.gather(1, a).squeeze(1)
+
+            with torch.no_grad():
+                if self.double_dqn:
+                    a2 = self.q(x2).argmax(dim=1, keepdim=True)
+                    q2 = self.q_tgt(x2).gather(1, a2).squeeze(1)
+                else:
+                    q2 = self.q_tgt(x2).max(dim=1).values
+
+                y = r + (1.0 - d) * self.gamma * q2
+
+            loss = F.smooth_l1_loss(q_sa, y)
+
+            self.opt.zero_grad()
+            loss.backward()
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.q.parameters(), self.grad_clip)
+            self.opt.step()
+
+        self._train_calls += 1
+        if self._train_calls % self.target_sync_every == 0:
+            self.q_tgt.load_state_dict(self.q.state_dict())
 
 
 # ============================
-# Experiment runner
+# Experiment runner (CIFAR-10)
 # ============================
 def run_experiment(
     rounds: int = 30,
     n_clients: int = 20,
     k_select: int = 5,
     dir_alpha: float = 0.3,
-    flip_fraction: float = 0.30,
-    flip_rate: float = 0.30,
+    flip_fraction: float = 0.50,
+    flip_rate: float = 0.80,
     max_per_client: int = 8000,
     local_lr: float = 0.02,
     local_steps: int = 20,
@@ -600,10 +616,16 @@ def run_experiment(
     dloss_batches: int = 2,
     ema_alpha: float = 0.10,
     print_every: int = 5,
-    bandit_eps: float = 0.10,
-    bandit_lr: float = 1e-3,
-    bandit_train_steps: int = 10,
-    use_metric_track: bool = True,
+    # DQN params
+    dqn_eps: float = 0.10,
+    dqn_lr: float = 1e-3,
+    dqn_gamma: float = 0.90,
+    dqn_train_steps: int = 10,
+    dqn_batch_size: int = 256,
+    dqn_buf_size: int = 20000,
+    dqn_target_sync_every: int = 10,
+    neg_ratio: int = 1,
+    use_metric_track: bool = False,
 ):
     tfm = transforms.Compose([
         transforms.ToTensor(),
@@ -624,12 +646,7 @@ def run_experiment(
         worker_init_fn=seed_worker,
         num_workers=0,
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=256,
-        shuffle=False,
-        num_workers=0,
-    )
+    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
     log_step(f"Gerando split Dirichlet (alpha={dir_alpha}) para {n_clients} clientes...")
     client_idxs = make_clients_dirichlet_indices(train_ds, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777)
@@ -672,15 +689,26 @@ def run_experiment(
     probe_ema_r = np.zeros(n_clients, dtype=np.float32)
     dloss_ema_r = np.zeros(n_clients, dtype=np.float32)
 
-    # Track B: BANDIT
-    model_ban = copy.deepcopy(base).to(DEVICE)
+    # Track B: DQN selector
+    model_dqn = copy.deepcopy(base).to(DEVICE)
     staleness_b = np.zeros(n_clients, dtype=np.float32)
     streak_b = np.zeros(n_clients, dtype=np.int32)
     probe_ema_b = np.zeros(n_clients, dtype=np.float32)
     dloss_ema_b = np.zeros(n_clients, dtype=np.float32)
-    bandit = NeuralContextualBandit(d_in=6, lr=bandit_lr, train_steps=bandit_train_steps)
+    dqn = DQNSelector(
+        d_in=6,
+        lr=dqn_lr,
+        weight_decay=1e-4,
+        gamma=dqn_gamma,
+        buf_size=dqn_buf_size,
+        batch_size=dqn_batch_size,
+        train_steps=dqn_train_steps,
+        grad_clip=1.0,
+        target_sync_every=dqn_target_sync_every,
+        double_dqn=True,
+    )
 
-    # Track C: METRIC
+    # Track C: METRIC (optional)
     if use_metric_track:
         model_met = copy.deepcopy(base).to(DEVICE)
         staleness_m = np.zeros(n_clients, dtype=np.float32)
@@ -693,102 +721,140 @@ def run_experiment(
     print(f"Flip: fraction_clients={flip_fraction} -> n_flip={n_flip} | flip_rate_samples={flip_rate}")
     print(f"Flip clients (fixed): {sorted(list(flip_clients))}")
     print(f"Avg client size (capped) ~ {np.mean(client_sizes):.1f} samples")
-    print("Comparando: RANDOM vs NEURAL BANDIT" + (" vs METRIC" if use_metric_track else "") + "\n")
+    print(f"DQN: eps={dqn_eps}, gamma={dqn_gamma}, train_steps={dqn_train_steps}, target_sync_every={dqn_target_sync_every}")
+    print("Comparando: RANDOM vs DQN" + (" vs METRIC" if use_metric_track else "") + "\n")
+
+    pending_prev: List[Tuple[int, int, np.ndarray, float]] = []
 
     for t in range(1, rounds + 1):
         t0 = time.time()
         log_step(f"\n[round {t}/{rounds}] começando...")
 
-        # Eval BEFORE
+        # ---- evaluation BEFORE updates
         l_r_before = eval_loss(model_rand, val_loader, max_batches=20)
         a_r = eval_acc(model_rand, test_loader, max_batches=80)
 
-        l_b_before = eval_loss(model_ban, val_loader, max_batches=20)
-        a_b = eval_acc(model_ban, test_loader, max_batches=80)
+        l_b_before = eval_loss(model_dqn, val_loader, max_batches=20)
+        a_b = eval_acc(model_dqn, test_loader, max_batches=80)
 
         if use_metric_track:
             l_m_before = eval_loss(model_met, val_loader, max_batches=20)
             a_m = eval_acc(model_met, test_loader, max_batches=80)
             log_step(
                 f"  eval | rand(loss={l_r_before:.4f}, acc={a_r*100:.2f}%) | "
-                f"ban(loss={l_b_before:.4f}, acc={a_b*100:.2f}%) | "
+                f"dqn(loss={l_b_before:.4f}, acc={a_b*100:.2f}%) | "
                 f"met(loss={l_m_before:.4f}, acc={a_m*100:.2f}%)"
             )
         else:
             log_step(
                 f"  eval | rand(loss={l_r_before:.4f}, acc={a_r*100:.2f}%) | "
-                f"ban(loss={l_b_before:.4f}, acc={a_b*100:.2f}%)"
+                f"dqn(loss={l_b_before:.4f}, acc={a_b*100:.2f}%)"
             )
 
-        # -------------------------
-        # RANDOM
-        # -------------------------
+        # =========================================================
+        # Track A: RANDOM
+        # =========================================================
         deltas_r, prox_r, probe_now_r, dloss_now_r = compute_deltas_prox_probe_dloss_now(
             model_rand, client_loaders, val_loader, local_lr, local_steps,
             probe_batches=probe_batches, dloss_batches=dloss_batches
         )
-        update_ema(probe_ema_r, probe_now_r, alpha=ema_alpha)
-        update_ema(dloss_ema_r, dloss_now_r, alpha=ema_alpha)
+        update_ema(probe_ema_r, probe_now_r, alpha=ema_alpha, init_if_zero=True)
+        update_ema(dloss_ema_r, dloss_now_r, alpha=ema_alpha, init_if_zero=True)
 
-        sel_r = random.sample(range(n_clients), k_select)
-        apply_fedavg(model_rand, deltas_r, sel_r)
-        update_staleness_streak(staleness_r, streak_r, sel_r)
+        selected_r = random.sample(range(n_clients), k_select)
+        apply_fedavg(model_rand, deltas_r, selected_r)
+        update_staleness_streak(staleness_r, streak_r, selected_r)
 
         l_r_after = eval_loss(model_rand, val_loader, max_batches=20)
         r_reward = float(l_r_before - l_r_after)
-        log_step(f"  RANDOM: sel={sel_r} | reward={r_reward:+.5f} (val {l_r_before:.4f}->{l_r_after:.4f})")
+        log_step(f"  RANDOM: sel={selected_r} | reward={r_reward:+.5f} (val {l_r_before:.4f}->{l_r_after:.4f})")
 
-        # -------------------------
-        # BANDIT
-        # -------------------------
+        # =========================================================
+        # Track B: DQN selector
+        # =========================================================
         deltas_b, prox_b, probe_now_b, dloss_now_b = compute_deltas_prox_probe_dloss_now(
-            model_ban, client_loaders, val_loader, local_lr, local_steps,
+            model_dqn, client_loaders, val_loader, local_lr, local_steps,
             probe_batches=probe_batches, dloss_batches=dloss_batches
         )
-        update_ema(probe_ema_b, probe_now_b, alpha=ema_alpha)
-        update_ema(dloss_ema_b, dloss_now_b, alpha=ema_alpha)
+        update_ema(probe_ema_b, probe_now_b, alpha=ema_alpha, init_if_zero=True)
+        update_ema(dloss_ema_b, dloss_now_b, alpha=ema_alpha, init_if_zero=True)
 
         Xb = build_context_matrix_nn(prox_b, probe_ema_b, staleness_b, streak_b, dloss_ema_b)
-        sel_b = select_topk_neural_bandit(bandit, Xb, k=k_select, eps=bandit_eps)
 
-        apply_fedavg(model_ban, deltas_b, sel_b)
-        update_staleness_streak(staleness_b, streak_b, sel_b)
+        # close previous pending transitions using current Xb as next-state
+        if pending_prev:
+            for (cid, a, x, r) in pending_prev:
+                x2 = Xb[cid]
+                dqn.add_transition(x=x, a=a, r=r, x2=x2, done=False)
 
-        l_b_after = eval_loss(model_ban, val_loader, max_batches=20)
+        selected_b = dqn.select_topk(Xb, k=k_select, eps=dqn_eps)
+        apply_fedavg(model_dqn, deltas_b, selected_b)
+        update_staleness_streak(staleness_b, streak_b, selected_b)
+
+        l_b_after = eval_loss(model_dqn, val_loader, max_batches=20)
         b_reward = float(l_b_before - l_b_after)
 
-        per_client_r = b_reward / max(1, len(sel_b))
-        for cid in sel_b:
-            bandit.add_experience(Xb[cid], per_client_r)
-        bandit.train()
+        per_client_r = b_reward / max(1, len(selected_b))
 
-        log_step(f"  BANDIT: sel={sel_b} | reward={b_reward:+.5f} (val {l_b_before:.4f}->{l_b_after:.4f})")
+        not_sel = [i for i in range(n_clients) if i not in set(selected_b)]
+        n_neg = min(len(not_sel), neg_ratio * k_select)
+        neg_cids = random.sample(not_sel, n_neg) if n_neg > 0 else []
 
-        # -------------------------
-        # METRIC (optional)
-        # -------------------------
+        pending_prev = []
+        for cid in selected_b:
+            pending_prev.append((cid, 1, Xb[cid].copy(), float(per_client_r)))
+        for cid in neg_cids:
+            pending_prev.append((cid, 0, Xb[cid].copy(), 0.0))
+
+        dqn.train()
+
+        log_step(f"  DQN: sel={selected_b} | reward={b_reward:+.5f} (val {l_b_before:.4f}->{l_b_after:.4f}) | neg={len(neg_cids)}")
+
+        # =========================================================
+        # Track C: METRIC (optional)
+        # =========================================================
         if use_metric_track:
             deltas_m, prox_m, probe_now_m, dloss_now_m = compute_deltas_prox_probe_dloss_now(
                 model_met, client_loaders, val_loader, local_lr, local_steps,
                 probe_batches=probe_batches, dloss_batches=dloss_batches
             )
-            update_ema(probe_ema_m, probe_now_m, alpha=ema_alpha)
-            update_ema(dloss_ema_m, dloss_now_m, alpha=ema_alpha)
+            update_ema(probe_ema_m, probe_now_m, alpha=ema_alpha, init_if_zero=True)
+            update_ema(dloss_ema_m, dloss_now_m, alpha=ema_alpha, init_if_zero=True)
 
-            sel_m = select_by_metric_prox_probeEMA_saturating(
-                prox_m, probe_ema_m, staleness_m, streak_m, k=k_select
+            selected_m = select_by_metric_prox_probeEMA_saturating(
+                prox=prox_m, probe_ema=probe_ema_m, staleness=staleness_m, streak=streak_m, k=k_select
             )
-            apply_fedavg(model_met, deltas_m, sel_m)
-            update_staleness_streak(staleness_m, streak_m, sel_m)
+            apply_fedavg(model_met, deltas_m, selected_m)
+            update_staleness_streak(staleness_m, streak_m, selected_m)
 
             l_m_after = eval_loss(model_met, val_loader, max_batches=20)
             m_reward = float(l_m_before - l_m_after)
-            log_step(f"  METRIC: sel={sel_m} | reward={m_reward:+.5f} (val {l_m_before:.4f}->{l_m_after:.4f})")
+            log_step(f"  METRIC: sel={selected_m} | reward={m_reward:+.5f} (val {l_m_before:.4f}->{l_m_after:.4f})")
 
         log_step(f"[round {t}/{rounds}] terminado em {time.time()-t0:.2f}s")
 
         if t % print_every == 0:
-            print(f"[summary @ {t:3d}] rand_loss={l_r_before:.4f} | ban_loss={l_b_before:.4f}", flush=True)
+            if use_metric_track:
+                print(
+                    f"[summary @ {t:3d}] "
+                    f"RAND loss={l_r_before:.4f} r={r_reward:+.4f} | "
+                    f"DQN  loss={l_b_before:.4f} r={b_reward:+.4f} | "
+                    f"MET  loss={l_m_before:.4f} r={m_reward:+.4f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[summary @ {t:3d}] "
+                    f"RAND loss={l_r_before:.4f} r={r_reward:+.4f} | "
+                    f"DQN  loss={l_b_before:.4f} r={b_reward:+.4f}",
+                    flush=True,
+                )
+
+    # flush last pending as terminal
+    if pending_prev:
+        for (cid, a, x, r) in pending_prev:
+            dqn.add_transition(x=x, a=a, r=r, x2=x, done=True)
+        dqn.train()
 
     print("\nDone.")
 
@@ -808,8 +874,13 @@ if __name__ == "__main__":
         dloss_batches=2,
         ema_alpha=0.10,
         print_every=5,
-        bandit_eps=0.10,
-        bandit_lr=1e-3,
-        bandit_train_steps=10,
-        use_metric_track=True,
+        dqn_eps=0.10,
+        dqn_lr=1e-3,
+        dqn_gamma=0.90,
+        dqn_train_steps=10,
+        dqn_batch_size=256,
+        dqn_buf_size=20000,
+        dqn_target_sync_every=10,
+        neg_ratio=1,
+        use_metric_track=False,
     )
