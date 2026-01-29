@@ -361,16 +361,67 @@ def make_server_val_balanced(ds, per_class: int = 200, n_classes: int = 10, seed
 # ============================
 # Dirichlet non-IID split
 # ============================
-def make_clients_dirichlet_indices(
+#def make_clients_dirichlet_indices(
+ #   train_ds,
+ #   n_clients: int = 50,
+ #   alpha: float = 0.3,
+ #   seed: int = 123,
+ #   n_classes: int = 10
+#) -> List[List[int]]:
+ #   rng = np.random.RandomState(seed)
+#
+  #  label_to_idxs: Dict[int, List[int]] = {i: [] for i in range(n_classes)}
+  #  for idx in range(len(train_ds)):
+  #      _, y = train_ds[idx]
+ #       label_to_idxs[int(y)].append(idx)
+#
+ #   for y in range(n_classes):
+ #       rng.shuffle(label_to_idxs[y])
+#
+ #   clients = [[] for _ in range(n_clients)]
+#
+   # for y in range(n_classes):
+   #     idxs = label_to_idxs[y]
+   #     props = rng.dirichlet(alpha * np.ones(n_clients))
+  #      counts = (props * len(idxs)).astype(int)
+#
+  #      diff = len(idxs) - counts.sum()
+ #       if diff > 0:
+ #           for j in rng.choice(n_clients, size=diff, replace=True):
+    #            counts[j] += 1
+   #     elif diff < 0:
+  #          for j in rng.choice(np.where(counts > 0)[0], size=-diff, replace=True):
+ #               counts[j] -= 1
+#
+      #  start = 0
+     #   for cid in range(n_clients):
+    #        c = counts[cid]
+   #        if c > 0:
+  #              clients[cid].extend(idxs[start:start + c])
+ #               start += c
+#
+  #  for cid in range(n_clients):
+ #       rng.shuffle(clients[cid])
+#
+    #return clients
+
+
+
+
+def make_clients_dirichlet_indices_minmax(
     train_ds,
     n_clients: int = 50,
     alpha: float = 0.3,
     seed: int = 123,
-    n_classes: int = 10
-) -> List[List[int]]:
+    n_classes: int = 10,
+    min_size: int = 500,
+    max_size: int = 2000,
+    max_tries: int = 10_000,
+):
     rng = np.random.RandomState(seed)
 
-    label_to_idxs: Dict[int, List[int]] = {i: [] for i in range(n_classes)}
+    # pega índices por classe
+    label_to_idxs = {i: [] for i in range(n_classes)}
     for idx in range(len(train_ds)):
         _, y = train_ds[idx]
         label_to_idxs[int(y)].append(idx)
@@ -378,32 +429,53 @@ def make_clients_dirichlet_indices(
     for y in range(n_classes):
         rng.shuffle(label_to_idxs[y])
 
-    clients = [[] for _ in range(n_clients)]
+    for _ in range(max_tries):
+        clients = [[] for _ in range(n_clients)]
 
-    for y in range(n_classes):
-        idxs = label_to_idxs[y]
-        props = rng.dirichlet(alpha * np.ones(n_clients))
-        counts = (props * len(idxs)).astype(int)
+        for y in range(n_classes):
+            idxs = label_to_idxs[y].copy()
+            rng.shuffle(idxs)
 
-        diff = len(idxs) - counts.sum()
-        if diff > 0:
-            for j in rng.choice(n_clients, size=diff, replace=True):
-                counts[j] += 1
-        elif diff < 0:
-            for j in rng.choice(np.where(counts > 0)[0], size=-diff, replace=True):
-                counts[j] -= 1
+            props = rng.dirichlet(alpha * np.ones(n_clients))
+            counts = (props * len(idxs)).astype(int)
 
-        start = 0
-        for cid in range(n_clients):
-            c = counts[cid]
-            if c > 0:
-                clients[cid].extend(idxs[start:start + c])
-                start += c
+            diff = len(idxs) - counts.sum()
+            if diff > 0:
+                for j in rng.choice(n_clients, size=diff, replace=True):
+                    counts[j] += 1
+            elif diff < 0:
+                pos = np.where(counts > 0)[0]
+                for j in rng.choice(pos, size=-diff, replace=True):
+                    counts[j] -= 1
 
-    for cid in range(n_clients):
-        rng.shuffle(clients[cid])
+            start = 0
+            for cid in range(n_clients):
+                c = counts[cid]
+                if c > 0:
+                    clients[cid].extend(idxs[start:start + c])
+                    start += c
 
-    return clients
+        sizes = np.array([len(c) for c in clients], dtype=int)
+        if sizes.min() >= min_size and sizes.max() <= max_size:
+            for cid in range(n_clients):
+                rng.shuffle(clients[cid])
+            return clients
+
+    raise RuntimeError(
+        f"Não achei split com min_size={min_size}, max_size={max_size} "
+        f"em {max_tries} tentativas. (alpha={alpha})"
+    )
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================
@@ -996,8 +1068,12 @@ def run_experiment(
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
     log_step(f"Gerando split Dirichlet (alpha={dir_alpha}) para {n_clients} clientes (em train_pool)...")
+    target = len(train_pool) // n_clients  # tamanho médio esperado
+
+
     client_idxs = make_clients_dirichlet_indices(
-        train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10
+        train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10,min_size=int(0.8 * target),
+    max_size=int(1.2 * target),
     )
 
     # ---------- Ataque acumulativo: inicial ----------
@@ -1018,6 +1094,10 @@ def run_experiment(
 
     g_train = torch.Generator()
     g_train.manual_seed(SEED + 10001)
+    
+    client_sizes_total: List[int] = []
+    client_sizes_train: List[int] = []
+    client_sizes_val: List[int] = []
 
     log_step("Criando loaders dos clientes + label flipping TARGETED determinístico (switchable, taxa ajustável)...")
     for cid, idxs in enumerate(client_idxs):
@@ -1055,6 +1135,11 @@ def run_experiment(
         val_pos = pos[:n_val].tolist()
         tr_pos  = pos[n_val:].tolist()
 
+        client_sizes_total.append(int(L))
+        client_sizes_train.append(int(len(tr_pos)))
+        client_sizes_val.append(int(len(val_pos)))
+
+
         ds_tr = Subset(ds_c, tr_pos)          # TREINO: com flip (atacantes)
         ds_val = Subset(ds_clean, val_pos)    # VAL: sem flip (limpo)
 
@@ -1079,6 +1164,23 @@ def run_experiment(
 
 
 
+
+
+    # ===== LOG: tamanhos por cliente ===== 
+    log["meta"]["client_sizes_total"] = list(map(int, client_sizes_total))
+    log["meta"]["client_sizes_train"] = list(map(int, client_sizes_train))
+    log["meta"]["client_sizes_val"]   = list(map(int, client_sizes_val))
+
+    sizes = np.array(client_sizes_total, dtype=np.int32)
+    print("\n[CLIENT DATA SIZES] cid | total | train | val")
+    for cid in range(n_clients):
+        print(f"  {cid:02d} | {client_sizes_total[cid]:4d} | {client_sizes_train[cid]:4d} | {client_sizes_val[cid]:4d}")
+
+        print(
+        f"\n[CLIENT SIZE STATS] total: "
+        f"min={sizes.min()} | mean={sizes.mean():.1f} | max={sizes.max()} | "
+        f"p10={int(np.percentile(sizes,10))} | p90={int(np.percentile(sizes,90))}\n"
+        )
 
 
 
@@ -1135,7 +1237,7 @@ def run_experiment(
     print(f"Global momentum: beta={mom_beta}")
     print(f"Estado VDN: [bias, proj_mom, probe_now, staleness_n, streak_n] (d=5)")
     print(f"PRINT adv/FO: every {print_advfo_every} rounds (0/<=0 desliga)")
-    print(f"Avg client size (capped) ~ {np.mean(client_sizes):.1f} samples")
+    print(f"Avg client size ~ {np.mean(client_sizes_total):.1f} samples")
     print(f"Tracks: [RANDOM] vs [VDN]\n")
 
 
