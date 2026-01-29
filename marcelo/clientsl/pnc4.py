@@ -170,7 +170,7 @@ def probing_loss(model: nn.Module, loader: DataLoader, batches: int = 1) -> floa
     return tot / max(1, n)
 
 def server_reference_grad(model: nn.Module, val_loader: DataLoader, batches: int = 10) -> torch.Tensor:
-    model.train()
+    model.eval()
     for p in model.parameters():
         if p.grad is not None:
             p.grad.zero_()
@@ -187,7 +187,7 @@ def server_reference_grad(model: nn.Module, val_loader: DataLoader, batches: int
     return gref
 
 def grad_on_loader(model: nn.Module, loader: DataLoader, batches: int = 10) -> torch.Tensor:
-    model.train()
+    model.eval()
     for p in model.parameters():
         if p.grad is not None:
             p.grad.zero_()
@@ -831,8 +831,8 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
             phase_cnt[i] += 1
 
     log_step("Baixando/carregando CIFAR-10...")
-    train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm_train)
-    test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
+    #train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm_train)
+    #test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
 
     log_step("Criando server_val balanceado (holdout do TRAIN) + train_pool (sem val)...")
     #server_val_idxs = make_server_val_balanced(train_ds, per_class=val_per_class, n_classes=10, seed=SEED + 4242)
@@ -840,7 +840,7 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
     server_val_set = set(server_val_idxs)
 
     server_val_set = set(server_val_idxs)
-    all_train_idxs = np.arange(len(train_ds))
+    all_train_idxs = np.arange(len(train_ds_eval))
     train_pool_idxs = [int(i) for i in all_train_idxs if int(i) not in server_val_set]
     #train_pool = Subset(train_ds, train_pool_idxs)
 
@@ -870,7 +870,8 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
     for cid in attacked_set:
         attack_rate_per_client[cid] = float(flip_rate_initial)
 
-    client_train_loaders, client_eval_loaders, client_sizes, switchable_ds = [], [], [], []
+    client_train_loaders, client_eval_loaders, client_grad_loaders = [], [], []
+    client_sizes = []
     switchable_ds = [] #guarda os pares train,eval
     g_train = torch.Generator(); g_train.manual_seed(SEED + 10001)
 
@@ -908,6 +909,12 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
         #client_eval_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=False, num_workers=0))
 
 
+        client_train_loaders.append(DataLoader(
+            ds_train, batch_size=64, shuffle=True,
+            generator=g_train, worker_init_fn=seed_worker, num_workers=0
+        ))
+    
+
         # probing loss (sem AUG, determinístico)
         client_eval_loaders.append(DataLoader(
             ds_eval, batch_size=64, shuffle=False, num_workers=0
@@ -916,7 +923,7 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
 
         # grad do cliente g_i (sem AUG) 
         client_grad_loaders.append(DataLoader(
-        ds_eval, batch_size=128, shuffle=True,
+        ds_eval, batch_size=128, shuffle=False,
         generator=g_train, worker_init_fn=seed_worker, num_workers=0
     ))
     
