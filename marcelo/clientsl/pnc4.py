@@ -377,66 +377,124 @@ def update_staleness_streak(staleness: np.ndarray, streak: np.ndarray, selected:
     #    np.array(fo, dtype=np.float32),
     #    mom.detach(),
     #)
-def compute_deltas_gp_score_probe_now_and_fo(
+#def compute_deltas_gp_score_probe_now_and_fo(
+ #   model: nn.Module,
+ #   client_train_loaders: List[DataLoader],
+ #   client_eval_loaders: List[DataLoader],
+ #   client_grad_loaders: List[DataLoader],
+ #   val_loader: DataLoader,
+ #   local_lr: float,
+ #   local_steps: int,
+ #   *,
+ #   g_prev: torch.Tensor,          # OBRIGATÓRIO: ∇F(w^{t-1})
+ #   probe_batches: int = 5,
+ #   gref_batches: int = 10,        # só pro FO (log)
+ #   client_grad_batches: int = 2,  # batches pra g_i
+#) -> Tuple[List[torch.Tensor], np.ndarray, np.ndarray, np.ndarray]:
+ #   """
+ #   Retorna:
+ #     deltas: Δw_i (treino local curto)
+ #     gp_score: c_i^t = (g_i · g_prev)/||g_prev||   [EXATO da figura]
+ #     probe_now: probing loss atual por cliente
+ #     fo: <dw_i, -gref/||gref||> (log)
+ #   """
+ #   assert g_prev is not None, "g_prev deve ser inicializado fora do loop e passado aqui."
+#
+ #   g_prev = g_prev.detach()
+  #  denom = float(g_prev.norm().item()) + 1e-12
+#
+ #   # gref atual (só para FO logging)
+  #  gref = grad_on_loader(model, val_loader, batches=gref_batches).detach()
+   # desc_gref_norm = (-gref) / (gref.norm() + 1e-12)
+#
+ #   deltas: List[torch.Tensor] = []
+  #  probe_now: List[float] = []
+   # gp_score: List[float] = []
+    #fo: List[float] = []
+
+    #for tr_loader, ev_loader, gr_loader in zip(client_train_loaders, client_eval_loaders,client_grad_loaders):
+     #   # (1) probe loss (igual antes)
+     #   probe_now.append(float(probing_loss(model, ev_loader, batches=probe_batches)))
+#
+ #       # (2) Δw_i via treino local (igual antes)
+  #      dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
+   #     deltas.append(dw)
+#
+ #       # (3) g_i = ∇F(w_i^t) no modelo ATUAL (sem step)
+  #      gi = grad_on_loader(model, gr_loader, batches=client_grad_batches).detach()
+#
+ #       # (4) SCORE EXATO DA FIGURA:
+  #      #     c_i^t = (gi · g_prev) / ||g_prev||
+   #     score_i = float(torch.dot(gi, g_prev).item()) / denom
+    #    gp_score.append(score_i)
+#
+ #       # (5) FO logging (igual seu jeito antigo, mas usando gref atual)
+  #      fo.append(float(torch.dot(dw, desc_gref_norm).item()))
+#
+ #   return (
+  #      deltas,
+   #     np.array(gp_score, dtype=np.float32),
+    #    np.array(probe_now, dtype=np.float32),
+    #    np.array(fo, dtype=np.float32),
+    #)
+
+
+def compute_gp_probe_fo_grad_only(
     model: nn.Module,
-    client_train_loaders: List[DataLoader],
     client_eval_loaders: List[DataLoader],
     client_grad_loaders: List[DataLoader],
     val_loader: DataLoader,
-    local_lr: float,
-    local_steps: int,
     *,
-    g_prev: torch.Tensor,          # OBRIGATÓRIO: ∇F(w^{t-1})
+    g_prev: torch.Tensor,          # ∇F(w^{t-1})
     probe_batches: int = 5,
-    gref_batches: int = 10,        # só pro FO (log)
-    client_grad_batches: int = 2,  # batches pra g_i
-) -> Tuple[List[torch.Tensor], np.ndarray, np.ndarray, np.ndarray]:
+    gref_batches: int = 10,        # para FO_grad
+    client_grad_batches: int = 2,  # batches para g_i
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
+    Sem treino local (SEM dw).
     Retorna:
-      deltas: Δw_i (treino local curto)
-      gp_score: c_i^t = (g_i · g_prev)/||g_prev||   [EXATO da figura]
-      probe_now: probing loss atual por cliente
-      fo: <dw_i, -gref/||gref||> (log)
+      gp_score[i]  = (g_i · g_prev) / ||g_prev||      (exato da figura)
+      probe_now[i] = probing loss
+      fo_grad[i]   = <g_i, -gref/||gref||>            (LOG barato; opcional)
     """
-    assert g_prev is not None, "g_prev deve ser inicializado fora do loop e passado aqui."
-
+    assert g_prev is not None, "g_prev deve ser passado (∇F(w^{t-1}))."
     g_prev = g_prev.detach()
     denom = float(g_prev.norm().item()) + 1e-12
 
-    # gref atual (só para FO logging)
+    # gref atual (apenas para LOG barato)
     gref = grad_on_loader(model, val_loader, batches=gref_batches).detach()
     desc_gref_norm = (-gref) / (gref.norm() + 1e-12)
 
-    deltas: List[torch.Tensor] = []
-    probe_now: List[float] = []
     gp_score: List[float] = []
-    fo: List[float] = []
+    probe_now: List[float] = []
+    fo_grad: List[float] = []
 
-    for tr_loader, ev_loader, gr_loader in zip(client_train_loaders, client_eval_loaders,client_grad_loaders):
-        # (1) probe loss (igual antes)
+    for ev_loader, gr_loader in zip(client_eval_loaders, client_grad_loaders):
         probe_now.append(float(probing_loss(model, ev_loader, batches=probe_batches)))
 
-        # (2) Δw_i via treino local (igual antes)
-        dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
-        deltas.append(dw)
-
-        # (3) g_i = ∇F(w_i^t) no modelo ATUAL (sem step)
         gi = grad_on_loader(model, gr_loader, batches=client_grad_batches).detach()
 
-        # (4) SCORE EXATO DA FIGURA:
-        #     c_i^t = (gi · g_prev) / ||g_prev||
         score_i = float(torch.dot(gi, g_prev).item()) / denom
         gp_score.append(score_i)
 
-        # (5) FO logging (igual seu jeito antigo, mas usando gref atual)
-        fo.append(float(torch.dot(dw, desc_gref_norm).item()))
+        fo_grad.append(float(torch.dot(gi, desc_gref_norm).item()))
 
     return (
-        deltas,
         np.array(gp_score, dtype=np.float32),
         np.array(probe_now, dtype=np.float32),
-        np.array(fo, dtype=np.float32),
+        np.array(fo_grad, dtype=np.float32),
     )
+
+
+def apply_fedavg_selected(model: nn.Module, delta_by_cid: Dict[int, torch.Tensor], selected: List[int]):
+    """Aplica FedAvg apenas com os deltas dos clientes selecionados."""
+    w = flatten_params(model).clone()
+    avg_dw = torch.stack([delta_by_cid[cid] for cid in selected], dim=0).mean(dim=0)
+    load_flat_params_(model, w + avg_dw)
+
+
+
+
 
 def local_train_model_and_delta(
     global_model: nn.Module,
@@ -997,10 +1055,23 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
             g_train.manual_seed(round_seed)
 
             a_rand = eval_acc(model_rand, test_loader, max_batches=80)
-            deltas_r, _, _, _= compute_deltas_gp_score_probe_now_and_fo(model_rand, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_rand, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
+
+
+            #deltas_r, _, _, _= compute_deltas_gp_score_probe_now_and_fo(model_rand, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_rand, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
+
+
+
+
             K = min(k_select, n_clients)
             sel_r = rng_random_sel.sample(range(n_clients), K)
-            apply_fedavg(model_rand, deltas_r, sel_r)
+
+            delta_by_cid_r = {}
+            for cid in sel_r:
+                delta_by_cid_r[cid] = local_train_delta(model_rand, client_train_loaders[cid], lr=local_lr, steps=local_steps)
+
+
+
+            apply_fedavg(model_rand, delta_by_cid_r, sel_r)
             bump_counts("random", sel_r)
             log["tracks"]["random"]["test_acc"].append(float(a_rand))
 
@@ -1008,7 +1079,19 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
             g_prev_rand = grad_on_loader(model_rand, val_loader, batches=g_prev_batches).detach()  # agora é ∇F(w^t)
 
             acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
-            deltas_v, gp_v, probe_now_v, fo_v = compute_deltas_gp_score_probe_now_and_fo(model_vdn, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_vdn, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
+
+            gp_v, probe_now_v, fo_grad_v = compute_gp_probe_fo_grad_only(
+                model_vdn,
+                client_eval_loaders,
+                client_grad_loaders,
+                val_loader,
+                g_prev=g_prev_vdn,
+                probe_batches=probe_batches,
+                gref_batches=10,
+                client_grad_batches=2,
+                )
+
+            #deltas_v, gp_v, probe_now_v, fo_v = compute_deltas_gp_score_probe_now_and_fo(model_vdn, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_vdn, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
             obs_v = build_context_matrix_vdn(gp_v, probe_now_v, staleness_v, streak_v)
 
             if pending_v is not None:
@@ -1059,7 +1142,16 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
                     print(f"  {cid:02d} | {flag:8s} | adv={adv[cid]:+.6f} | FO={float(fo_v[cid]):+.6f}")
                 print("")
 
-            apply_fedavg(model_vdn, deltas_v, sel_v)
+
+            delta_by_cid_v = {}
+            for cid in sel_v:
+                delta_by_cid_v[cid] = local_train_delta(model_vdn, client_train_loaders[cid], lr=local_lr, steps=local_steps)
+
+
+
+
+
+            apply_fedavg(model_vdn, delta_by_cid_v, sel_v)
             g_prev_vdn = grad_on_loader(model_vdn, val_loader, batches=g_prev_batches).detach()
             update_staleness_streak(staleness_v, streak_v, sel_v)
             l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
