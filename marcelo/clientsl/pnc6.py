@@ -325,6 +325,18 @@ class SwitchableTargetedLabelFlipSubset(Dataset):
             y = int(self.flipped_label[i])
         return x, y
 
+class CleanViewOfSwitchable(Dataset):
+    """Mesmo cliente (mesmos índices), mas SEM flip: usa rótulo original do base_ds."""
+    def __init__(self, flip_ds: SwitchableTargetedLabelFlipSubset):
+        self.base_ds = flip_ds.base_ds
+        self.indices = flip_ds.indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        return self.base_ds[self.indices[i]]
+
 
 # ============================
 # Server balanced validation (from TRAIN)
@@ -956,21 +968,6 @@ def run_experiment(
             phase_cnt[i] += 1
 
 
-class CleanViewOfSwitchable(Dataset):
-    """Mesmo cliente (mesmos índices), mas SEM flip: usa rótulo original do base_ds."""
-    def __init__(self, flip_ds: SwitchableTargetedLabelFlipSubset):
-        self.base_ds = flip_ds.base_ds
-        self.indices = flip_ds.indices
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, i):
-        return self.base_ds[self.indices[i]]
-
-
-
-
 
     # ---------- Data ----------
     log_step("Baixando/carregando CIFAR-10...")
@@ -1143,7 +1140,7 @@ class CleanViewOfSwitchable(Dataset):
 
 
     client_val_every = 10
-    client_val_max_batches = 20  # controla custo; aumente se quiser mais "completo"
+    client_val_max_batches = 9999  # controla custo; aumente se quiser mais "completo"
 
 
 
@@ -1192,7 +1189,6 @@ class CleanViewOfSwitchable(Dataset):
                 model_rand,
                 client_train_loaders,
                 client_probe_loaders,
-                client_val_loaders,
                 val_loader,
                 local_lr,
                 local_steps,
@@ -1218,7 +1214,7 @@ class CleanViewOfSwitchable(Dataset):
             deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
                 model_vdn,
                 client_train_loaders,
-                client_val_loaders,
+                client_probe_loaders,
                 val_loader,
                 local_lr,
                 local_steps,
@@ -1303,6 +1299,36 @@ class CleanViewOfSwitchable(Dataset):
             apply_fedavg(model_vdn, deltas_v, sel_v)
             update_staleness_streak(staleness_v, streak_v, sel_v)
 
+            if (t % client_val_every) == 0:
+                print(f"\n[CLIENT VAL CLEAN @ round {t}] (20% holdout, sem flip)")
+
+                accs = np.zeros(n_clients, dtype=np.float32)
+                losses = np.zeros(n_clients, dtype=np.float32)
+
+                for cid in range(n_clients):
+                    losses[cid] = float(eval_loss(model_vdn, client_val_loaders[cid], max_batches=client_val_max_batches                    ))
+                    accs[cid]   = float(eval_acc(model_vdn,  client_val_loaders[cid], max_batches=client_val_max_batches                    ))
+
+                    flag = "ATTACKER" if cid in attacked_set else "HONEST"
+                    print(f"  cid {cid:02d} | {flag:8s} | loss={losses[cid]:.4f} | acc={accs[cid]*100:.2f}%")
+
+                print(f"[CLIENT VAL CLEAN @ round {t}] mean_loss={losses.mean():.4f} | mean_acc={accs.mean()*100:.2f}%\n                ")
+
+            
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
             l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
             loss_hist_v.append(l_after)
             r_v = windowed_reward(loss_hist_v[:-1], l_after, W=reward_window_W)
@@ -1350,12 +1376,12 @@ if __name__ == "__main__":
         rounds=500,
         n_clients=50,
         k_select=15,
-        dir_alpha=0.3,
+        dir_alpha=0.1,
 
         initial_flip_fraction=0.4,
         flip_add_fraction=0.0,
         attack_rounds=[600],
-        flip_rate_initial=1.0,
+        flip_rate_initial=1,
         flip_rate_new_attack=0.0,
 
         # TARGETED:
