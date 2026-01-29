@@ -60,7 +60,7 @@ from torchvision import datasets, transforms
 def log_step(msg: str):
     print(msg, flush=True)
 
-SEED = 1002
+SEED = 1000
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -381,6 +381,7 @@ def compute_deltas_gp_score_probe_now_and_fo(
     model: nn.Module,
     client_train_loaders: List[DataLoader],
     client_eval_loaders: List[DataLoader],
+    client_grad_loaders: List[DataLoader],
     val_loader: DataLoader,
     local_lr: float,
     local_steps: int,
@@ -411,7 +412,7 @@ def compute_deltas_gp_score_probe_now_and_fo(
     gp_score: List[float] = []
     fo: List[float] = []
 
-    for tr_loader, ev_loader in zip(client_train_loaders, client_eval_loaders):
+    for tr_loader, ev_loader, gr_loader in zip(client_train_loaders, client_eval_loaders,client_grad_loaders):
         # (1) probe loss (igual antes)
         probe_now.append(float(probing_loss(model, ev_loader, batches=probe_batches)))
 
@@ -420,7 +421,7 @@ def compute_deltas_gp_score_probe_now_and_fo(
         deltas.append(dw)
 
         # (3) g_i = ∇F(w_i^t) no modelo ATUAL (sem step)
-        gi = grad_on_loader(model, tr_loader, batches=client_grad_batches).detach()
+        gi = grad_on_loader(model, gr_loader, batches=client_grad_batches).detach()
 
         # (4) SCORE EXATO DA FIGURA:
         #     c_i^t = (gi · g_prev) / ||g_prev||
@@ -762,8 +763,28 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
         attack_rounds = [150]
     attack_rounds = sorted(list(set(int(x) for x in attack_rounds)))
     mean = (0.4914, 0.4822, 0.4465); std  = (0.2470, 0.2435, 0.2616)
-    tfm_train = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    tfm_test  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+
+    tfm_train_aug = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ]
+                                       )
+    tfm_eval = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+])
+
+    train_ds_aug  = datasets.CIFAR10(root="./data", train=True,  download=True,  transform=tfm_train_aug)
+    train_ds_eval = datasets.CIFAR10(root="./data", train=True,  download=False, transform=tfm_eval)
+    test_ds       = datasets.CIFAR10(root="./data", train=False, download=True,  transform=tfm_eval)
+    
+
+
+
+    #tfm_train = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+    #tfm_test  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
 
     run_id = uuid.uuid4().hex[:10]
     out_path = Path(out_dir) / f"results_random_vs_vdn_targeted_PROJMOM_FO_seed{SEED}_{run_id}.json"
@@ -814,19 +835,34 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
     test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
 
     log_step("Criando server_val balanceado (holdout do TRAIN) + train_pool (sem val)...")
-    server_val_idxs = make_server_val_balanced(train_ds, per_class=val_per_class, n_classes=10, seed=SEED + 4242)
+    #server_val_idxs = make_server_val_balanced(train_ds, per_class=val_per_class, n_classes=10, seed=SEED + 4242)
+    server_val_idxs = make_server_val_balanced(train_ds_eval, per_class=val_per_class, n_classes=10, seed=SEED + 4242)
+    server_val_set = set(server_val_idxs)
+
     server_val_set = set(server_val_idxs)
     all_train_idxs = np.arange(len(train_ds))
     train_pool_idxs = [int(i) for i in all_train_idxs if int(i) not in server_val_set]
-    train_pool = Subset(train_ds, train_pool_idxs)
+    #train_pool = Subset(train_ds, train_pool_idxs)
+
+    train_pool_aug  = Subset(train_ds_aug,  train_pool_idxs)   # treino local
+    train_pool_eval = Subset(train_ds_eval, train_pool_idxs)   # probing/grad
 
     g_val = torch.Generator(); g_val.manual_seed(SEED + 123)
-    val_loader = DataLoader(Subset(train_ds, server_val_idxs), batch_size=256, shuffle=val_shuffle, generator=g_val, worker_init_fn=seed_worker, num_workers=0)
+    #val_loader = DataLoader(Subset(train_ds, server_val_idxs), batch_size=256, shuffle=val_shuffle, generator=g_val, worker_init_fn=seed_worker, num_workers=0)
+    val_loader = DataLoader(
+        Subset(train_ds_eval, server_val_idxs),
+        batch_size=256,
+        shuffle=val_shuffle,
+        generator=g_val,
+        worker_init_fn=seed_worker,
+        num_workers=0
+        )
+
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
     log_step(f"Gerando split Dirichlet (alpha={dir_alpha}) para {n_clients} clientes (em train_pool)...")
-    client_idxs = make_clients_dirichlet_indices(train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10)
-
+    #client_idxs = make_clients_dirichlet_indices(train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10)
+    client_idxs = make_clients_dirichlet_indices(train_pool_eval, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777,n_classes=10)
     n_init = int(round(initial_flip_fraction * n_clients))
     rng_init = np.random.RandomState(SEED + 999)
     attacked_set = set(rng_init.choice(np.arange(n_clients), size=n_init, replace=False).tolist()) if n_init > 0 else set()
@@ -835,18 +871,55 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
         attack_rate_per_client[cid] = float(flip_rate_initial)
 
     client_train_loaders, client_eval_loaders, client_sizes, switchable_ds = [], [], [], []
+    switchable_ds = [] #guarda os pares train,eval
     g_train = torch.Generator(); g_train.manual_seed(SEED + 10001)
 
     log_step("Criando loaders dos clientes + label flipping TARGETED determinístico (switchable, taxa ajustável)...")
     for cid, idxs in enumerate(client_idxs):
         if max_per_client is not None:
             idxs = idxs[:max_per_client]
-        client_sizes.append(len(idxs))
-        ds_c = SwitchableTargetedLabelFlipSubset(train_pool, idxs, n_classes=10, seed=SEED + 1000 + cid, enabled=(cid in attacked_set),
-                                                 attack_rate=float(attack_rate_per_client[cid]), target_map=target_map, only_map_classes=targeted_only_map_classes)
-        switchable_ds.append(ds_c)
-        client_train_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=True, generator=g_train, worker_init_fn=seed_worker, num_workers=0))
-        client_eval_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=False, num_workers=0))
+        #client_sizes.append(len(idxs))
+        #ds_c = SwitchableTargetedLabelFlipSubset(train_pool, idxs, n_classes=10, seed=SEED + 1000 + cid, enabled=(cid in attacked_set),attack_rate=float(attack_rate_per_client[cid]), target_map=target_map, only_map_classes=targeted_only_map_classes)
+        # --- dataset para TREINO (com AUG) --
+        ds_train = SwitchableTargetedLabelFlipSubset(
+            train_pool_aug, idxs,
+            n_classes=10, seed=SEED + 1000 + cid,
+            enabled=(cid in attacked_set),
+            attack_rate=float(attack_rate_per_client[cid]),
+            target_map=target_map,
+            only_map_classes=targeted_only_map_classes
+            )   
+
+        # --- dataset para EVAL/GRAD (sem AUG) ---
+        ds_eval = SwitchableTargetedLabelFlipSubset(
+            train_pool_eval, idxs,
+            n_classes=10, seed=SEED + 1000 + cid,
+            enabled=(cid in attacked_set),
+            attack_rate=float(attack_rate_per_client[cid]),
+            target_map=target_map,
+            only_map_classes=targeted_only_map_classes
+    )
+
+
+        #switchable_ds.append(ds_c)
+        switchable_ds.append((ds_train, ds_eval))
+
+        #client_train_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=True, generator=g_train, worker_init_fn=seed_worker, num_workers=0))
+        #client_eval_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=False, num_workers=0))
+
+
+        # probing loss (sem AUG, determinístico)
+        client_eval_loaders.append(DataLoader(
+            ds_eval, batch_size=64, shuffle=False, num_workers=0
+            ))
+
+
+        # grad do cliente g_i (sem AUG) 
+        client_grad_loaders.append(DataLoader(
+        ds_eval, batch_size=128, shuffle=True,
+        generator=g_train, worker_init_fn=seed_worker, num_workers=0
+    ))
+    
 
     base = SmallCNN().to(DEVICE)
 
@@ -901,8 +974,14 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
                 add_now = candidates[:min(n_add, len(candidates))]
                 for cid in add_now:
                     attacked_set.add(cid); attack_rate_per_client[cid] = float(flip_rate_new_attack)
-                for cid, ds in enumerate(switchable_ds):
-                    ds.set_attack(cid in attacked_set, float(attack_rate_per_client[cid]) if cid in attacked_set else 0.0)
+                #for cid, ds in enumerate(switchable_ds):
+                    #ds.set_attack(cid in attacked_set, float(attack_rate_per_client[cid]) if cid in attacked_set else 0.0)
+                for cid, (ds_tr, ds_ev) in enumerate(switchable_ds):
+                    rate = float(attack_rate_per_client[cid]) if cid in attacked_set else 0.0
+                    ds_tr.set_attack(cid in attacked_set, rate)
+                    ds_ev.set_attack(cid in attacked_set, rate) 
+
+
                 log["attack_schedule"].append({"round": int(t), "added_clients": list(map(int, add_now)), "rate_for_added": float(flip_rate_new_attack),
                                               "attacked_total_after": int(len(attacked_set))})
                 log_step(f"  >>> ATTACK ADD @ round {t}: adicionados {len(add_now)} novos atacados | attacked_total={len(attacked_set)}")
@@ -911,7 +990,7 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
             g_train.manual_seed(round_seed)
 
             a_rand = eval_acc(model_rand, test_loader, max_batches=80)
-            deltas_r, _, _, _= compute_deltas_gp_score_probe_now_and_fo(model_rand, client_train_loaders, client_eval_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_rand, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
+            deltas_r, _, _, _= compute_deltas_gp_score_probe_now_and_fo(model_rand, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_rand, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
             K = min(k_select, n_clients)
             sel_r = rng_random_sel.sample(range(n_clients), K)
             apply_fedavg(model_rand, deltas_r, sel_r)
@@ -922,7 +1001,7 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
             g_prev_rand = grad_on_loader(model_rand, val_loader, batches=g_prev_batches).detach()  # agora é ∇F(w^t)
 
             acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
-            deltas_v, gp_v, probe_now_v, fo_v = compute_deltas_gp_score_probe_now_and_fo(model_vdn, client_train_loaders, client_eval_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_vdn, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
+            deltas_v, gp_v, probe_now_v, fo_v = compute_deltas_gp_score_probe_now_and_fo(model_vdn, client_train_loaders, client_eval_loaders, client_grad_loaders, val_loader, local_lr, local_steps, g_prev=g_prev_vdn, probe_batches=probe_batches,gref_batches=10, client_grad_batches=2)
             obs_v = build_context_matrix_vdn(gp_v, probe_now_v, staleness_v, streak_v)
 
             if pending_v is not None:
@@ -974,7 +1053,7 @@ def run_experiment(rounds: int = 300, n_clients: int = 50, k_select: int = 15, d
                 print("")
 
             apply_fedavg(model_vdn, deltas_v, sel_v)
-            g_prev_v = grad_on_loader(model_vdn, val_loader, batches=10).detach()
+            g_prev_vdn = grad_on_loader(model_vdn, val_loader, batches=g_prev_batches).detach()
             update_staleness_streak(staleness_v, streak_v, sel_v)
             l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
             loss_hist_v.append(l_after)
@@ -1014,7 +1093,7 @@ if __name__ == "__main__":
         initial_flip_fraction=0.4,
         flip_add_fraction=0,
         attack_rounds=[600],
-        flip_rate_initial=0.6,
+        flip_rate_initial=0.7,
         flip_rate_new_attack=0.0,
         targeted_only_map_classes=True, 
         target_map=None,
