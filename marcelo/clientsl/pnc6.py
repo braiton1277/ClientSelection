@@ -1071,9 +1071,9 @@ def run_experiment(
     target = len(train_pool) // n_clients  # tamanho médio esperado
 
 
-    client_idxs = make_clients_dirichlet_indices(
-        train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10,min_size=int(0.8 * target),
-    max_size=int(1.2 * target),
+    client_idxs = make_clients_dirichlet_indices_minmax(
+        train_pool, n_clients=n_clients, alpha=dir_alpha, seed=SEED + 777, n_classes=10,min_size=int(0.2 * target),
+    max_size=int(1.8 * target),
     )
 
     # ---------- Ataque acumulativo: inicial ----------
@@ -1176,7 +1176,7 @@ def run_experiment(
     for cid in range(n_clients):
         print(f"  {cid:02d} | {client_sizes_total[cid]:4d} | {client_sizes_train[cid]:4d} | {client_sizes_val[cid]:4d}")
 
-        print(
+    print(
         f"\n[CLIENT SIZE STATS] total: "
         f"min={sizes.min()} | mean={sizes.mean():.1f} | max={sizes.max()} | "
         f"p10={int(np.percentile(sizes,10))} | p90={int(np.percentile(sizes,90))}\n"
@@ -1478,9 +1478,9 @@ if __name__ == "__main__":
         rounds=500,
         n_clients=50,
         k_select=15,
-        dir_alpha=0.1,
+        dir_alpha=0.3,
 
-        initial_flip_fraction=0.4,
+        initial_flip_fraction=0,
         flip_add_fraction=0.0,
         attack_rounds=[600],
         flip_rate_initial=1,
@@ -1490,7 +1490,7 @@ if __name__ == "__main__":
         targeted_only_map_classes=True,
         target_map=None,
 
-        max_per_client=2500,
+        max_per_client=None,
         local_lr=0.01,
         local_steps=10,
         probe_batches=5,
