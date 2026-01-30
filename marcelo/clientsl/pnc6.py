@@ -154,6 +154,57 @@ def eval_loss(model: nn.Module, loader: DataLoader, max_batches: int = 20) -> fl
     return total / max(1, n)
 
 
+def _fmt_pct(x: float, n: int) -> str:
+    if n <= 0 or (x != x):  # NaN
+        return "NA"
+    return f"{x*100:.2f}%"
+
+
+
+
+
+
+@torch.no_grad()
+def group_mean_client_acc_clean(
+    model: nn.Module,
+    client_val_loaders: List[DataLoader],
+    attacked_set: set,
+    max_batches: int = 5,
+) -> Tuple[float, float, int, int]:
+    """
+    Média da acurácia (holdout limpo de cada cliente) separando HONEST vs ATTACKER.
+    Retorna: (mean_honest, mean_attacker, n_honest, n_attacker)
+    """
+    n_clients = len(client_val_loaders)
+    accs = np.zeros(n_clients, dtype=np.float32)
+
+    for cid in range(n_clients):
+        accs[cid] = float(eval_acc(model, client_val_loaders[cid], max_batches=max_batches))
+
+    mask_att = np.zeros(n_clients, dtype=bool)
+    for cid in attacked_set:
+        if 0 <= cid < n_clients:
+            mask_att[cid] = True
+
+    mask_hon = ~mask_att
+    n_att = int(mask_att.sum())
+    n_hon = int(mask_hon.sum())
+
+    mean_att = float(accs[mask_att].mean()) if n_att > 0 else float("nan")
+    mean_hon = float(accs[mask_hon].mean()) if n_hon > 0 else float("nan")
+
+    return mean_hon, mean_att, n_hon, n_att
+
+
+
+
+
+
+
+
+
+
+
 @torch.no_grad()
 def eval_acc(model: nn.Module, loader: DataLoader, max_batches: int = 80) -> float:
     model.eval()
@@ -997,11 +1048,15 @@ def run_experiment(
                 "test_acc": [],
                 "selection_count_total_per_client": [0] * int(n_clients),
                 "selection_phases": [],
+                "client_val_clean_mean_acc_honest": [],
+                "client_val_clean_mean_acc_attacker": [],
             },
             "vdn": {
                 "test_acc": [],
                 "selection_count_total_per_client": [0] * int(n_clients),
                 "selection_phases": [],
+                "client_val_clean_mean_acc_honest": [],
+                "client_val_clean_mean_acc_attacker": [],
             },
         },
     }
@@ -1242,6 +1297,9 @@ def run_experiment(
 
 
     client_val_every = 10
+    group_acc_every = 1            # 1 = toda rodada (como você pediu)
+    group_acc_max_batches = 5 
+    
     client_val_max_batches = 9999  # controla custo; aumente se quiser mais "completo"
 
 
@@ -1303,6 +1361,31 @@ def run_experiment(
             sel_r = rng_random_sel.sample(range(n_clients), K)
             apply_fedavg(model_rand, deltas_r, sel_r)
             
+
+              
+          
+
+            # ===== NOVO: média de acurácia (val limpo) por grupo: HONEST vs ATTACKER =====
+            if (t % group_acc_every) == 0:
+                mean_h, mean_a, n_h, n_a = group_mean_client_acc_clean(
+                model_rand, client_val_loaders, attacked_set, max_batches=group_acc_max_batches
+                )
+                print(
+                    f"[RANDOM/FEDAVG GROUP ACC @ round {t}] "
+                    f"HONEST(n={n_h})={_fmt_pct(mean_h, n_h)} | "
+                    f"ATTACKER(n={n_a})={_fmt_pct(mean_a, n_a)}"
+                    )
+                # (opcional) salvar no JSON
+                log["tracks"]["random"]["client_val_clean_mean_acc_honest"].append(None if (mean_h != mean_h) else float(mean_h))
+                log["tracks"]["random"]["client_val_clean_mean_acc_attacker"].append(None if (mean_a != mean_a) else float(mean_a))
+
+
+
+
+
+
+
+
 
 
             if (t % client_val_every) == 0:
@@ -1425,6 +1508,29 @@ def run_experiment(
 
             apply_fedavg(model_vdn, deltas_v, sel_v)
             update_staleness_streak(staleness_v, streak_v, sel_v)
+
+
+
+            # ===== NOVO: média de acurácia (val limpo) por grupo: HONEST vs ATTACKER =====
+            if (t % group_acc_every) == 0:
+                mean_h, mean_a, n_h, n_a = group_mean_client_acc_clean(
+                model_vdn, client_val_loaders, attacked_set, max_batches=group_acc_max_batches
+                )
+                print(
+                    f"[VDN/MARL GROUP ACC @ round {t}] "
+                    f"HONEST(n={n_h})={_fmt_pct(mean_h, n_h)} | "
+                    f"ATTACKER(n={n_a})={_fmt_pct(mean_a, n_a)}"
+                    )
+                # (opcional) salvar no JSON
+                log["tracks"]["vdn"]["client_val_clean_mean_acc_honest"].append(None if (mean_h != mean_h) else float(mean_h))
+                log["tracks"]["vdn"]["client_val_clean_mean_acc_attacker"].append(None if (mean_a != mean_a) else float(mean_a))
+
+        
+            
+
+
+
+
 
             if (t % client_val_every) == 0:
                 print(f"\n[CLIENT VAL CLEAN @ round {t}] (20% holdout, sem flip)")
