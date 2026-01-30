@@ -1343,7 +1343,7 @@ def run_experiment(
             # ============================================================
             # TRACK A: RANDOM
             # ============================================================
-            a_rand = eval_acc(model_rand, test_loader, max_batches=80)
+            
 
             deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
                 model_rand,
@@ -1381,6 +1381,8 @@ def run_experiment(
 
 
 
+             a_rand = eval_acc(model_rand, test_loader, max_batches=80)
+             log["tracks"]["random"]["test_acc"].append(float(a_rand))  
 
 
 
@@ -1412,12 +1414,12 @@ def run_experiment(
 
 
             bump_counts("random", sel_r)
-            log["tracks"]["random"]["test_acc"].append(float(a_rand))
+            
 
             # ============================================================
             # TRACK B: VDN
             # ============================================================
-            acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
+            
 
             _l_before = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
 
@@ -1526,8 +1528,8 @@ def run_experiment(
                 log["tracks"]["vdn"]["client_val_clean_mean_acc_attacker"].append(None if (mean_a != mean_a) else float(mean_a))
 
         
-            
-
+             acc_v = eval_acc(model_vdn, test_loader, max_batches=80) 
+             log["tracks"]["vdn"]["test_acc"].append(float(acc_v)v)
 
 
 
@@ -1579,7 +1581,7 @@ def run_experiment(
                 trained = True
 
             bump_counts("vdn", sel_v)
-            log["tracks"]["vdn"]["test_acc"].append(float(acc_v))
+            
 
             if t % print_every == 0:
                 a_r = log["tracks"]["random"]["test_acc"][-1]
