@@ -1302,6 +1302,31 @@ def run_experiment(
             K = min(k_select, n_clients)
             sel_r = rng_random_sel.sample(range(n_clients), K)
             apply_fedavg(model_rand, deltas_r, sel_r)
+            
+
+
+            if (t % client_val_every) == 0:
+                print(f"\n[RANDOM CLIENT VAL CLEAN @ round {t}] (20% holdout, sem flip)")
+
+                accs_r = np.zeros(n_clients, dtype=np.float32)
+                losses_r = np.zeros(n_clients, dtype=np.float32)
+
+                for cid in range(n_clients):
+                    losses_r[cid] = float(eval_loss(model_rand, client_val_loaders[cid], max_batches=client_val_max_batches))
+                    accs_r[cid]   = float(eval_acc(model_rand,  client_val_loaders[cid], max_batches=client_val_max_batches))
+
+                    flag = "ATTACKER" if cid in attacked_set else "HONEST"
+                    print(f"  cid {cid:02d} | {flag:8s} | loss={losses_r[cid]:.4f} | acc={accs_r[cid]*100:.2f}%")
+
+                print(
+                    f"[RANDOM CLIENT VAL CLEAN @ round {t}] "
+                    f"mean_loss={losses_r.mean():.4f} | mean_acc={accs_r.mean()*100:.2f}%\n"
+                )
+
+
+
+
+
 
             bump_counts("random", sel_r)
             log["tracks"]["random"]["test_acc"].append(float(a_rand))
@@ -1476,11 +1501,11 @@ def run_experiment(
 if __name__ == "__main__":
     run_experiment(
         rounds=500,
-        n_clients=50,
-        k_select=15,
-        dir_alpha=0.3,
+        n_clients=25,
+        k_select=7,
+        dir_alpha=0.15,
 
-        initial_flip_fraction=0,
+        initial_flip_fraction=0.4,
         flip_add_fraction=0.0,
         attack_rounds=[600],
         flip_rate_initial=1,
