@@ -51,7 +51,7 @@ def log_step(msg: str):
 # ============================
 # Reproducibility (global)
 # ============================
-SEED = 2048
+SEED = 2
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -90,25 +90,127 @@ def gini_coefficient(x: np.ndarray) -> float:
 # ============================
 # Model (CIFAR-10 CNN)
 # ============================
+# # 
+from torchvision.models import resnet18
+
+
+
+
 class SmallCNN(nn.Module):
     def __init__(self, n_classes: int = 10):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)  # 32->16->8
-        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-        self.pool2 = nn.MaxPool2d(2, 2)  # 8->4
-        self.fc1 = nn.Linear(128 * 4 * 4, 256)
-        self.fc2 = nn.Linear(256, n_classes)
+        m = resnet18(weights=None)
+        # CIFAR-10: 32x32 -> conv1 3x3 stride 1, sem maxpool
+        m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        m.maxpool = nn.Identity()
+        m.fc = nn.Linear(m.fc.in_features, n_classes)
+        self.net = m
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(F.relu(self.conv3(x)))
-        x = self.pool2(x)
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        return self.net(x)
+
+
+
+
+
+
+
+
+
+
+# 
+# class SmallCNN(nn.Module):    
+#     def __init__(self, n_classes: int = 10):
+#         super().__init__()
+#         self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+#         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+#         self.pool = nn.MaxPool2d(2, 2)  # 32->16->8
+#         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+#         self.pool2 = nn.MaxPool2d(2, 2)  # 8->4
+#         self.fc1 = nn.Linear(128 * 4 * 4, 256)
+#         self.fc2 = nn.Linear(256, n_classes)
+# 
+#     def forward(self, x):
+#         # Camada de entrada: Conv + ReLU + Pool (32x32 -> 16x16)
+#         x = self.pool(F.relu(self.conv1(x)))
+#     
+#         # Camada 2: Conv + ReLU + Pool (16x16 -> 8x8)
+#         x = self.pool(F.relu(self.conv2(x)))
+#     
+#         # Camada 3: Conv + ReLU + Pool (8x8 -> 4x4)
+#         x = self.pool(F.relu(self.conv3(x))) # Note que usei self.pool aqui
+#     
+#         # Flatten (128 * 4 * 4 = 2048)
+#         x = x.view(x.size(0), -1)
+#     
+#         # Camada 4
+#         x = F.relu(self.fc1(x))
+#     
+#         # Saída
+#         return self.fc2(x)
+# 
+
+# 
+#     def forward(self, x):
+#         x = F.relu(self.conv1(x))
+#         x = self.pool(F.relu(self.conv2(x)))
+#         x = self.pool(F.relu(self.conv3(x)))
+#         x = self.pool2(x)
+#         x = x.view(x.size(0), -1)
+#         x = F.relu(self.fc1(x))
+#         return self.fc2(x)
+# 
+# 
+# class SmallCNN(nn.Module):
+#     def __init__(self, n_classes: int = 10):
+#         super().__init__()
+#         self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+#         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+#         self.pool  = nn.MaxPool2d(2, 2)   # 32 -> 16
+#         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+#         self.pool2 = nn.MaxPool2d(2, 2)   # 8 -> 4
+#         self.fc1   = nn.Linear(128 * 4 * 4, 256)
+#         self.fc2   = nn.Linear(256, n_classes)
+# 
+#     def forward(self, x):
+#         x = F.relu(self.conv1(x))
+#         x = self.pool(F.relu(self.conv2(x)))   # 32 -> 16
+#         x = self.pool(F.relu(self.conv3(x)))   # 16 -> 8
+#         x = self.pool2(x)                      # 8 -> 4
+#         x = torch.flatten(x, 1)                # (B, 128*4*4)
+#         x = F.relu(self.fc1(x))
+#         return self.fc2(x)
+# 
+# 
+# 
+# class SmallCNN(nn.Module):
+#     def __init__(self, n_classes: int = 10):
+#         super().__init__()
+# 
+#         # Tabela: Conv(3,6,5) + Pool(2x2)
+#         self.conv1 = nn.Conv2d(3, 6, kernel_size=5)
+#         self.pool  = nn.MaxPool2d(2, 2)
+# 
+#         # Tabela: Conv(6,16,5) + Pool(2x2)
+#         self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+# 
+#         # (Opcional) Mantém nomes antigos pra não quebrar nada se seu código acessar isso
+#         self.conv3 = nn.Identity()
+#         self.pool2 = nn.Identity()
+# 
+#         # Para entrada 32x32: após conv/pool/conv/pool => 16 x 5 x 5 = 400
+#         self.fc1 = nn.Linear(16 * 5 * 5, 120)
+#         self.fc2 = nn.Linear(120, 84)
+#         self.fc3 = nn.Linear(84, n_classes)
+# 
+#     def forward(self, x):
+#         x = self.pool(F.relu(self.conv1(x)))
+#         x = self.pool(F.relu(self.conv2(x)))
+#         x = torch.flatten(x, 1)        # (B, 400) se entrada for 32x32
+#         x = F.relu(self.fc1(x))
+#         x = F.relu(self.fc2(x))
+#         return self.fc3(x)
+# 
 
 
 # ============================
@@ -263,33 +365,92 @@ def server_reference_grad(model: nn.Module, val_loader: DataLoader, batches: int
 # ============================
 # Local training delta
 # ============================
+# def local_train_delta(
+#     global_model: nn.Module,
+#     train_loader: DataLoader,
+#     lr: float = 0.01,
+#     steps: int = 10,
+# ) -> torch.Tensor:
+#     model = copy.deepcopy(global_model).to(DEVICE)
+#     model.train()
+#     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+#     #opt = torch.optim.Adam(model.parameters(), lr=lr)
+#     w0 = flatten_params(model).clone()
+# 
+#     it = iter(train_loader)
+#     for _ in range(steps):
+#         try:
+#             x, y = next(it)
+#         except StopIteration:
+#             it = iter(train_loader)
+#             x, y = next(it)
+#         x, y = x.to(DEVICE), y.to(DEVICE)
+#         opt.zero_grad()
+#         loss = F.cross_entropy(model(x), y)
+#         loss.backward()
+#         opt.step()
+# 
+#     w1 = flatten_params(model)
+#     dw = (w1 - w0).detach()
+#     return dw
+# 
+
+
+
+
+
 def local_train_delta(
     global_model: nn.Module,
     train_loader: DataLoader,
     lr: float = 0.01,
-    steps: int = 10,
+    local_epochs: int = 1,
+    momentum: float = 0.0,
+    weight_decay: float = 0.0,
+    grad_clip: float = 0.0,
 ) -> torch.Tensor:
     model = copy.deepcopy(global_model).to(DEVICE)
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+
+    opt = torch.optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=False,   # deixa False; se for usar, momentum precisa >0 e dampening=0
+    )
+
     w0 = flatten_params(model).clone()
 
-    it = iter(train_loader)
-    for _ in range(steps):
-        try:
-            x, y = next(it)
-        except StopIteration:
-            it = iter(train_loader)
-            x, y = next(it)
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        opt.zero_grad()
-        loss = F.cross_entropy(model(x), y)
-        loss.backward()
-        opt.step()
+    for _ in range(int(local_epochs)):
+        for x, y in train_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            opt.zero_grad()
+            loss = F.cross_entropy(model(x), y)
+            loss.backward()
+
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            opt.step()
 
     w1 = flatten_params(model)
-    dw = (w1 - w0).detach()
-    return dw
+    return (w1 - w0).detach()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================
@@ -554,10 +715,13 @@ def compute_deltas_proj_mom_probe_now_and_fo(
     client_eval_loaders: List[DataLoader],
     val_loader: DataLoader,
     local_lr: float,
-    local_steps: int,
+    local_epochs: int,
     probe_batches: int = 1,
     mom: Optional[torch.Tensor] = None,
     mom_beta: float = 0.90,
+    local_momentum: float = 0.0,
+    local_weight_decay: float = 0.0,
+    local_grad_clip: float = 0.0,
 ) -> Tuple[List[torch.Tensor], np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     # gref explícito no server_val
     gref = server_reference_grad(model, val_loader, batches=10)
@@ -584,7 +748,16 @@ def compute_deltas_proj_mom_probe_now_and_fo(
     for tr_loader, ev_loader in zip(client_train_loaders, client_eval_loaders):
         probe_now.append(float(probing_loss(model, ev_loader, batches=probe_batches)))
 
-        dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
+        #dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
+        dw = local_train_delta(
+            model,
+            tr_loader,
+            lr=local_lr,
+            local_epochs=local_epochs,
+            momentum=local_momentum,
+            weight_decay=local_weight_decay,
+            grad_clip=local_grad_clip,
+            )
         deltas.append(dw)
 
         proj_mom.append(float(torch.dot(dw, desc_mom_norm).item()))
@@ -958,7 +1131,10 @@ def run_experiment(
 
     max_per_client: int = 2500,
     local_lr: float = 0.01,
-    local_steps: int = 10,
+    local_epochs: int = 1,
+    local_momentum: float = 0.0,
+    local_weight_decay: float = 0.0,
+    local_grad_clip: float = 0.0,
     probe_batches: int = 5,
 
     # GLOBAL MOMENTUM
@@ -1199,7 +1375,7 @@ def run_experiment(
         ds_val = Subset(ds_clean, val_pos)    # VAL: sem flip (limpo)
 
         client_train_loaders.append(
-            DataLoader(ds_tr, batch_size=64, shuffle=True, generator=g_train, worker_init_fn=seed_worker, num_workers=0)
+            DataLoader(ds_tr, batch_size=32, shuffle=True, generator=g_train, worker_init_fn=seed_worker, num_workers=0)
             )
 
 
@@ -1345,17 +1521,43 @@ def run_experiment(
             # ============================================================
             
 
+#             deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
+#                 model_rand,
+#                 client_train_loaders,
+#                 client_probe_loaders,
+#                 val_loader,
+#                 local_lr,
+#                 local_steps,
+#                 probe_batches=probe_batches,
+#                 mom=None,
+#                 mom_beta=mom_beta,
+#             )
+#
+
+             
             deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
-                model_rand,
-                client_train_loaders,
-                client_probe_loaders,
-                val_loader,
-                local_lr,
-                local_steps,
-                probe_batches=probe_batches,
-                mom=None,
-                mom_beta=mom_beta,
-            )
+    model=model_rand,
+    client_train_loaders=client_train_loaders,
+    client_eval_loaders=client_probe_loaders,
+    val_loader=val_loader,
+    local_lr=local_lr,
+    local_epochs=local_epochs,
+    probe_batches=probe_batches,
+    mom=None,
+    mom_beta=mom_beta,
+    local_momentum=local_momentum,
+    local_weight_decay=local_weight_decay,
+    local_grad_clip=local_grad_clip,
+)
+
+
+
+
+
+
+
+
+
 
             K = min(k_select, n_clients)
             sel_r = rng_random_sel.sample(range(n_clients), K)
@@ -1381,8 +1583,8 @@ def run_experiment(
 
 
 
-             a_rand = eval_acc(model_rand, test_loader, max_batches=80)
-             log["tracks"]["random"]["test_acc"].append(float(a_rand))  
+            a_rand = eval_acc(model_rand, test_loader, max_batches=80)
+            log["tracks"]["random"]["test_acc"].append(float(a_rand))  
 
 
 
@@ -1423,17 +1625,43 @@ def run_experiment(
 
             _l_before = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
 
+#             deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
+#                 model_vdn,
+#                 client_train_loaders,
+#                 client_probe_loaders,
+#                 val_loader,
+#                 local_lr,
+#                 local_steps,
+#                 probe_batches=probe_batches,
+#                 mom=mom_v,
+#                 mom_beta=mom_beta,
+#             )
+#
+
+
+
             deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
-                model_vdn,
-                client_train_loaders,
-                client_probe_loaders,
-                val_loader,
-                local_lr,
-                local_steps,
-                probe_batches=probe_batches,
-                mom=mom_v,
-                mom_beta=mom_beta,
-            )
+    model=model_vdn,
+    client_train_loaders=client_train_loaders,
+    client_eval_loaders=client_probe_loaders,   # ou client_val_loaders (você escolhe)
+    val_loader=val_loader,
+    local_lr=local_lr,
+    local_epochs=local_epochs,                  # <- vamos criar isso (ver abaixo)
+    probe_batches=probe_batches,
+    mom=mom_v,
+    mom_beta=mom_beta,
+    local_momentum=local_momentum,
+    local_weight_decay=local_weight_decay,
+    local_grad_clip=local_grad_clip,
+)
+
+
+
+
+
+
+
+
 
             obs_v = build_context_matrix_vdn(
                 projection_mom=proj_mom_v,
@@ -1528,8 +1756,8 @@ def run_experiment(
                 log["tracks"]["vdn"]["client_val_clean_mean_acc_attacker"].append(None if (mean_a != mean_a) else float(mean_a))
 
         
-             acc_v = eval_acc(model_vdn, test_loader, max_batches=80) 
-             log["tracks"]["vdn"]["test_acc"].append(float(acc_v)v)
+            acc_v = eval_acc(model_vdn, test_loader, max_batches=80) 
+            log["tracks"]["vdn"]["test_acc"].append(float(acc_v))
 
 
 
@@ -1609,9 +1837,9 @@ def run_experiment(
 if __name__ == "__main__":
     run_experiment(
         rounds=500,
-        n_clients=25,
-        k_select=7,
-        dir_alpha=0.15,
+        n_clients=50,
+        k_select=15,
+        dir_alpha=0.3,
 
         initial_flip_fraction=0.4,
         flip_add_fraction=0.0,
@@ -1624,10 +1852,12 @@ if __name__ == "__main__":
         target_map=None,
 
         max_per_client=None,
-        local_lr=0.01,
-        local_steps=10,
+        local_lr=0.005,
+        local_epochs=5,
         probe_batches=5,
-
+        local_momentum=0.95,
+        local_weight_decay=1e-4,
+        local_grad_clip=0.0,
         # GLOBAL MOMENTUM
         mom_beta=0.90,
 
@@ -1642,7 +1872,7 @@ if __name__ == "__main__":
 
         warmup_transitions=50,
         start_train_round=50,
-        updates_per_round=50,
+        updates_per_round=20,
         train_every=1,
 
         buf_size=20000,
