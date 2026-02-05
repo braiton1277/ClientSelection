@@ -244,6 +244,7 @@ def load_flat_params_(model: nn.Module, flat: torch.Tensor) -> None:
 @torch.no_grad()
 def eval_loss(model: nn.Module, loader: DataLoader, max_batches: int = 20) -> float:
     model.eval()
+    
     total = 0.0
     n = 0
     for b, (x, y) in enumerate(loader):
@@ -341,7 +342,8 @@ def probing_loss(model: nn.Module, loader: DataLoader, batches: int = 1) -> floa
 # Server reference gradient (explicit)
 # ============================
 def server_reference_grad(model: nn.Module, val_loader: DataLoader, batches: int = 10) -> torch.Tensor:
-    model.train()
+    #model.train()
+    model.eval()
     for p in model.parameters():
         if p.grad is not None:
             p.grad.zero_()
@@ -398,7 +400,6 @@ def server_reference_grad(model: nn.Module, val_loader: DataLoader, batches: int
 
 
 
-
 def local_train_delta(
     global_model: nn.Module,
     train_loader: DataLoader,
@@ -407,7 +408,7 @@ def local_train_delta(
     momentum: float = 0.0,
     weight_decay: float = 0.0,
     grad_clip: float = 0.0,
-) -> torch.Tensor:
+):
     model = copy.deepcopy(global_model).to(DEVICE)
     model.train()
 
@@ -416,7 +417,7 @@ def local_train_delta(
         lr=lr,
         momentum=momentum,
         weight_decay=weight_decay,
-        nesterov=False,   # deixa False; se for usar, momentum precisa >0 e dampening=0
+        nesterov=False,
     )
 
     w0 = flatten_params(model).clone()
@@ -427,18 +428,21 @@ def local_train_delta(
             opt.zero_grad()
             loss = F.cross_entropy(model(x), y)
             loss.backward()
-
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
             opt.step()
 
     w1 = flatten_params(model)
-    return (w1 - w0).detach()
+    dw = (w1 - w0).detach()  # (no DEVICE)
 
+    # <<< NOVO: extrai buffers da BN (em CPU pra não estourar GPU)
+    sd = model.state_dict()
+    bn_buf = {}
+    for k, v in sd.items():
+        if ("running_mean" in k) or ("running_var" in k) or ("num_batches_tracked" in k):
+            bn_buf[k] = v.detach().cpu().clone()
 
-
-
+    return dw, bn_buf
 
 
 
@@ -722,6 +726,7 @@ def compute_deltas_proj_mom_probe_now_and_fo(
     local_momentum: float = 0.0,
     local_weight_decay: float = 0.0,
     local_grad_clip: float = 0.0,
+    bn_bufs: List[Dict[str, torch.Tensor]] = []
 ) -> Tuple[List[torch.Tensor], np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     # gref explícito no server_val
     gref = server_reference_grad(model, val_loader, batches=10)
@@ -749,7 +754,7 @@ def compute_deltas_proj_mom_probe_now_and_fo(
         probe_now.append(float(probing_loss(model, ev_loader, batches=probe_batches)))
 
         #dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
-        dw = local_train_delta(
+        dw, bn_buf = local_train_delta(
             model,
             tr_loader,
             lr=local_lr,
@@ -763,22 +768,89 @@ def compute_deltas_proj_mom_probe_now_and_fo(
         proj_mom.append(float(torch.dot(dw, desc_mom_norm).item()))
         fo.append(float(torch.dot(dw, desc_gref_norm).item()))
 
+        deltas.append(dw.detach().cpu())
+        bn_bufs.append(bn_buf)
+
+
     return (
         deltas,
         np.array(proj_mom, dtype=np.float32),
         np.array(probe_now, dtype=np.float32),
         np.array(fo, dtype=np.float32),
         mom.detach(),
+        bn_bufs,
     )
+
+def apply_fedavg_bn_buffers(
+    model: nn.Module,
+    bn_bufs_per_client: List[Dict[str, torch.Tensor]],
+    selected: List[int],
+    weights: List[int],
+):
+    if not selected:
+        return
+    if not bn_bufs_per_client or not bn_bufs_per_client[selected[0]]:
+        return  # modelo sem BN, ou nada coletado
+
+    total = float(sum(weights)) if sum(weights) > 0 else float(len(weights))
+    sd = model.state_dict()
+    keys = bn_bufs_per_client[selected[0]].keys()
+
+    for k in keys:
+        t0 = bn_bufs_per_client[selected[0]][k]
+        # não-float (ex: num_batches_tracked): copia do primeiro
+        if not torch.is_floating_point(t0):
+            if k in sd:
+                sd[k].copy_(t0.to(sd[k].device))
+            continue
+
+        acc = torch.zeros_like(t0, dtype=torch.float32)
+        for cid, w in zip(selected, weights):
+            acc += bn_bufs_per_client[cid][k].to(acc.device) * (float(w) / total)
+
+        if k in sd:
+            sd[k].copy_(acc.to(sd[k].device))
+
+
 
 
 # ============================
 # Apply FedAvg
 # ============================
-def apply_fedavg(model: nn.Module, deltas: List[torch.Tensor], selected: List[int]):
+# def apply_fedavg(model: nn.Module, deltas: List[torch.Tensor], selected: List[int]):
+#     w = flatten_params(model).clone()
+#     avg_dw = torch.stack([deltas[i] for i in selected], dim=0).mean(dim=0)
+#     load_flat_params_(model, w + avg_dw)
+# 
+
+
+
+
+
+
+
+
+def apply_fedavg(model: nn.Module, deltas: List[torch.Tensor], selected: List[int], weights: Optional[List[int]] = None):
     w = flatten_params(model).clone()
-    avg_dw = torch.stack([deltas[i] for i in selected], dim=0).mean(dim=0)
+    if weights is None:
+        avg_dw = torch.stack([deltas[i] for i in selected], dim=0).mean(dim=0)
+    else:
+        tot = float(sum(weights)) if sum(weights) > 0 else float(len(weights))
+        avg_dw = torch.zeros_like(deltas[selected[0]], dtype=torch.float32)
+        for i, wi in zip(selected, weights):
+            avg_dw += deltas[i].to(avg_dw.device) * (float(wi) / tot)
+
+    avg_dw = avg_dw.to(w.device)  # <<< garante DEVICE do modelo
     load_flat_params_(model, w + avg_dw)
+
+
+
+
+
+
+
+
+
 
 
 # ============================
@@ -1113,6 +1185,7 @@ class VDNSelector:
 # Experiment runner
 # ============================
 def run_experiment(
+    RUN_RANDOM = False,    
     rounds: int = 300,
     n_clients: int = 50,
     k_select: int = 15,
@@ -1188,7 +1261,7 @@ def run_experiment(
     # ---------- JSON log skeleton ----------
     run_id = uuid.uuid4().hex[:10]
     out_path = Path(out_dir) / f"results_random_vs_vdn_targeted_PROJMOM_FO_seed{SEED}_{run_id}.json"
-
+    
     log = {
         "meta": {
             "run_id": run_id,
@@ -1219,26 +1292,28 @@ def run_experiment(
             "print_advfo_every": int(print_advfo_every),
         },
         "attack_schedule": [],
-        "tracks": {
-            "random": {
+        "tracks": {}
+
+        }
+
+    if RUN_RANDOM:
+        log["tracks"]["random"] = {
                 "test_acc": [],
                 "selection_count_total_per_client": [0] * int(n_clients),
                 "selection_phases": [],
                 "client_val_clean_mean_acc_honest": [],
                 "client_val_clean_mean_acc_attacker": [],
-            },
-            "vdn": {
-                "test_acc": [],
-                "selection_count_total_per_client": [0] * int(n_clients),
-                "selection_phases": [],
-                "client_val_clean_mean_acc_honest": [],
-                "client_val_clean_mean_acc_attacker": [],
-            },
-        },
-    }
+                }
+    log["tracks"]["vdn"] = {
+            "test_acc": [],
+            "selection_count_total_per_client": [0] * int(n_clients),
+            "selection_phases": [],
+            "client_val_clean_mean_acc_honest": [],
+            "client_val_clean_mean_acc_attacker": [],
+                } 
 
     def save_json_safely():
-        for key in ["random", "vdn"]:
+        for key in list(log["tracks"].keys()):
             cnt_total = np.array(log["tracks"][key]["selection_count_total_per_client"], dtype=np.int64)
             log["tracks"][key]["final_metrics"] = {
                 "gini_selection_total": float(gini_coefficient(cnt_total)),
@@ -1421,10 +1496,13 @@ def run_experiment(
     # ---------- Models ----------
     base = SmallCNN().to(DEVICE)
 
-    # RANDOM baseline
-    model_rand = copy.deepcopy(base).to(DEVICE)
-    rng_random_sel = random.Random(SEED + 424242)
-    start_new_phase("random", 1, sorted(list(attacked_set)))
+
+
+    if RUN_RANDOM:
+        model_rand = copy.deepcopy(base).to(DEVICE)
+        rng_random_sel = random.Random(SEED + 424242)
+        start_new_phase("random", 1, sorted(list(attacked_set)))
+
 
     # VDN
     model_vdn = copy.deepcopy(base).to(DEVICE)
@@ -1472,8 +1550,8 @@ def run_experiment(
     print(f"Tracks: [RANDOM] vs [VDN]\n")
 
 
-    client_val_every = 10
-    group_acc_every = 1            # 1 = toda rodada (como você pediu)
+    client_val_every = 0
+    group_acc_every = 0            # 1 = toda rodada (como você pediu)
     group_acc_max_batches = 5 
     
     client_val_max_batches = 9999  # controla custo; aumente se quiser mais "completo"
@@ -1534,8 +1612,8 @@ def run_experiment(
 #             )
 #
 
-             
-            deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
+            if RUN_RANDOM: 
+                deltas_r, _, _, _, _, bn_r = compute_deltas_proj_mom_probe_now_and_fo(
     model=model_rand,
     client_train_loaders=client_train_loaders,
     client_eval_loaders=client_probe_loaders,
@@ -1548,7 +1626,7 @@ def run_experiment(
     local_momentum=local_momentum,
     local_weight_decay=local_weight_decay,
     local_grad_clip=local_grad_clip,
-)
+    )      
 
 
 
@@ -1558,17 +1636,18 @@ def run_experiment(
 
 
 
-
-            K = min(k_select, n_clients)
-            sel_r = rng_random_sel.sample(range(n_clients), K)
-            apply_fedavg(model_rand, deltas_r, sel_r)
-            
+                w_r = [client_sizes_train[i] for i in sel_r]
+                K = min(k_select, n_clients)
+                sel_r = rng_random_sel.sample(range(n_clients), K)
+                apply_fedavg(model_rand, deltas_r, sel_r, weights=w_r)
+                apply_fedavg_bn_buffers(model_rand, bn_r, sel_r, weights=w_r)
 
               
           
 
             # ===== NOVO: média de acurácia (val limpo) por grupo: HONEST vs ATTACKER =====
-            if (t % group_acc_every) == 0:
+            #if (t % group_acc_every) == 0:
+            if group_acc_every and (t % group_acc_every) == 0:
                 mean_h, mean_a, n_h, n_a = group_mean_client_acc_clean(
                 model_rand, client_val_loaders, attacked_set, max_batches=group_acc_max_batches
                 )
@@ -1583,8 +1662,8 @@ def run_experiment(
 
 
 
-            a_rand = eval_acc(model_rand, test_loader, max_batches=80)
-            log["tracks"]["random"]["test_acc"].append(float(a_rand))  
+                a_rand = eval_acc(model_rand, test_loader, max_batches=80)
+                log["tracks"]["random"]["test_acc"].append(float(a_rand))  
 
 
 
@@ -1592,7 +1671,8 @@ def run_experiment(
 
 
 
-            if (t % client_val_every) == 0:
+            #if (t % client_val_every) == 0:
+            if client_val_every and (t % client_val_every) == 0:
                 print(f"\n[RANDOM CLIENT VAL CLEAN @ round {t}] (20% holdout, sem flip)")
 
                 accs_r = np.zeros(n_clients, dtype=np.float32)
@@ -1615,7 +1695,7 @@ def run_experiment(
 
 
 
-            bump_counts("random", sel_r)
+                bump_counts("random", sel_r)
             
 
             # ============================================================
@@ -1640,7 +1720,7 @@ def run_experiment(
 
 
 
-            deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
+            deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v, bn_v = compute_deltas_proj_mom_probe_now_and_fo(
     model=model_vdn,
     client_train_loaders=client_train_loaders,
     client_eval_loaders=client_probe_loaders,   # ou client_val_loaders (você escolhe)
@@ -1709,7 +1789,8 @@ def run_experiment(
 
 
 
-            if t % client_val_every == 0:
+            #if t % client_val_every == 0:
+            if client_val_every and (t % client_val_every == 0):
                 # valida TODOS os clientes no holdout limpo (20%)
                 losses = []
                 accs = []
@@ -1735,14 +1816,16 @@ def run_experiment(
                     flag = "ATTACKER" if cid in attacked_set else "HONEST"
                     print(f"  {cid:02d} | {flag:8s} | adv={adv[cid]:+.6f} | FO={float(fo_v[cid]):+.6f}")
                 print("")
-
-            apply_fedavg(model_vdn, deltas_v, sel_v)
+            w_v = [client_sizes_train[i] for i in sel_v]
+            apply_fedavg(model_vdn, deltas_v, sel_v,weights=w_v)
+            apply_fedavg_bn_buffers(model_vdn, bn_v, sel_v, weights=w_v)
             update_staleness_streak(staleness_v, streak_v, sel_v)
 
 
 
             # ===== NOVO: média de acurácia (val limpo) por grupo: HONEST vs ATTACKER =====
-            if (t % group_acc_every) == 0:
+            #if (t % group_acc_every) == 0:
+            if group_acc_every and (t % group_acc_every == 0):
                 mean_h, mean_a, n_h, n_a = group_mean_client_acc_clean(
                 model_vdn, client_val_loaders, attacked_set, max_batches=group_acc_max_batches
                 )
@@ -1762,7 +1845,8 @@ def run_experiment(
 
 
 
-            if (t % client_val_every) == 0:
+            #if (t % client_val_every) == 0:
+            if client_val_every and (t % client_val_every == 0):    
                 print(f"\n[CLIENT VAL CLEAN @ round {t}] (20% holdout, sem flip)")
 
                 accs = np.zeros(n_clients, dtype=np.float32)
@@ -1812,16 +1896,27 @@ def run_experiment(
             
 
             if t % print_every == 0:
-                a_r = log["tracks"]["random"]["test_acc"][-1]
+                
                 a_v = log["tracks"]["vdn"]["test_acc"][-1]
-                msg = (
-                    f"[summary @ {t:3d}] "
-                    f"RANDOM acc={a_r*100:.2f}% | "
-                    f"VDN acc={a_v*100:.2f}% | "
-                    f"attacked_total={len(attacked_set)} | "
-                    f"buf_n={agent_v.buf.n} | trained={int(trained)}"
-                )
-                print(msg, flush=True)
+
+
+                if RUN_RANDOM and len(log["tracks"]["random"]["test_acc"]) > 0:
+                    a_r = log["tracks"]["random"]["test_acc"][-1]
+                    msg = f"[summary @ {t:3d}] RANDOM acc={a_r*100:.2f}% | VDN acc={a_v*100:.2f}% | attacked_total={len(attacked_set)} | buf_n={agent_v.buf.n} | trained={int(trained)}"
+
+
+                else:
+                    msg = f"[summary @ {t:3d}] VDN acc={a_v*100:.2f}% | attacked_total={len(attacked_set)} | buf_n={agent_v.buf.n} | trained={int(trained)}"
+                    print(msg, flush=True)
+
+
+
+
+
+
+
+
+
 
         # fecha transição pendente
         if pending_v is not None:
@@ -1836,6 +1931,7 @@ def run_experiment(
 
 if __name__ == "__main__":
     run_experiment(
+        RUN_RANDOM = False,
         rounds=500,
         n_clients=50,
         k_select=15,
@@ -1853,7 +1949,7 @@ if __name__ == "__main__":
 
         max_per_client=None,
         local_lr=0.005,
-        local_epochs=5,
+        local_epochs=4,
         probe_batches=5,
         local_momentum=0.95,
         local_weight_decay=1e-4,
