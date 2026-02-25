@@ -6,7 +6,8 @@ if __name__ == "__main__":
         n_clients=50,
         k_select=15,
         dir_alpha=0.3,
-
+        run_random=False,
+        run_vdn=True,
         initial_flip_fraction=0.4,
         flip_add_fraction=0.0,
         attack_rounds=[600],
@@ -17,8 +18,9 @@ if __name__ == "__main__":
         target_map=None,
 
         max_per_client=2500,
-        local_lr=0.01,
-        local_steps=10,
+        local_lr=0.005,
+        #local_steps=10,
+        local_epochs = 5,
         probe_batches=10,
 
         mom_beta=0.90,

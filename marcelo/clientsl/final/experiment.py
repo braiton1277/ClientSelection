@@ -41,8 +41,11 @@ def run_experiment(
     target_map: Optional[Dict[int, int]] = None,
     # Treino
     max_per_client: int = 2500,
-    local_lr: float = 0.01,
+    local_lr: float = 0.005,
     local_steps: int = 10,
+    local_epochs: int = None,    # se passado, sobrescreve local_steps
+    run_random: bool = True,     # toggle track RANDOM
+    run_vdn: bool = True,        # toggle track VDN
     probe_batches: int = 5,
     mom_beta: float = 0.90,
     # RL
@@ -80,7 +83,18 @@ def run_experiment(
 
     mean = (0.4914, 0.4822, 0.4465)
     std  = (0.2470, 0.2435, 0.2616)
-    tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+
+    tfm_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+    tfm_eval = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
 
     # ---------- JSON ----------
     run_id = uuid.uuid4().hex[:10]
@@ -102,6 +116,10 @@ def run_experiment(
             "start_train_round": int(start_train_round),
             "updates_per_round": int(updates_per_round), "train_every": int(train_every),
             "print_advfo_every": int(print_advfo_every),
+            "local_epochs": local_epochs,
+            "local_steps": local_steps,
+            "run_random": run_random,
+            "run_vdn": run_vdn,
         },
         "attack_schedule": [],
         "tracks": {
@@ -141,17 +159,21 @@ def run_experiment(
 
     # ---------- Dados ----------
     log_step("Carregando CIFAR-10...")
-    train_ds = datasets.CIFAR10(root="./data", train=True,  download=True, transform=tfm)
-    test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm)
 
-    server_val_idxs = make_server_val_balanced(train_ds, per_class=val_per_class, seed=SEED + 4242)
+    train_ds      = datasets.CIFAR10(root="./data", train=True,  download=True, transform=tfm_train)
+    train_ds_eval = datasets.CIFAR10(root="./data", train=True,  download=True, transform=tfm_eval)
+    test_ds       = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_eval)
+
+    server_val_idxs = make_server_val_balanced(train_ds_eval, per_class=val_per_class, seed=SEED + 4242)
     server_val_set  = set(server_val_idxs)
     train_pool_idxs = [int(i) for i in range(len(train_ds)) if int(i) not in server_val_set]
-    train_pool = Subset(train_ds, train_pool_idxs)
+
+    train_pool      = Subset(train_ds,      train_pool_idxs)
+    train_pool_eval = Subset(train_ds_eval, train_pool_idxs)
 
     g_val = torch.Generator()
     g_val.manual_seed(SEED + 123)
-    val_loader  = DataLoader(Subset(train_ds, server_val_idxs), batch_size=256,
+    val_loader  = DataLoader(Subset(train_ds_eval, server_val_idxs), batch_size=256,
                              shuffle=val_shuffle, generator=g_val, worker_init_fn=seed_worker, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
@@ -176,6 +198,7 @@ def run_experiment(
     client_eval_loaders:  List[DataLoader] = []
     client_sizes: List[int] = []
     switchable_ds: List[SwitchableTargetedLabelFlipSubset] = []
+    switchable_ds_eval: List[SwitchableTargetedLabelFlipSubset] = []
 
     g_train = torch.Generator()
     g_train.manual_seed(SEED + 10001)
@@ -185,7 +208,7 @@ def run_experiment(
             idxs = idxs[:max_per_client]
         client_sizes.append(len(idxs))
 
-        ds_c = SwitchableTargetedLabelFlipSubset(
+        ds_c_train = SwitchableTargetedLabelFlipSubset(
             base_ds=train_pool, indices=idxs, n_classes=10,
             seed=SEED + 1000 + cid,
             enabled=(cid in attacked_set),
@@ -193,38 +216,54 @@ def run_experiment(
             target_map=target_map,
             only_map_classes=targeted_only_map_classes,
         )
-        switchable_ds.append(ds_c)
-        client_train_loaders.append(DataLoader(ds_c, batch_size=64, shuffle=True,
+
+        ds_c_eval = SwitchableTargetedLabelFlipSubset(
+            base_ds=train_pool_eval, indices=idxs, n_classes=10,
+            seed=SEED + 1000 + cid,
+            enabled=(cid in attacked_set),
+            attack_rate=float(attack_rate_per_client[cid]),
+            target_map=target_map,
+            only_map_classes=targeted_only_map_classes,
+        )
+
+        switchable_ds.append(ds_c_train)
+        switchable_ds_eval.append(ds_c_eval)
+
+        client_train_loaders.append(DataLoader(ds_c_train, batch_size=32, shuffle=True,
                                                generator=g_train, worker_init_fn=seed_worker, num_workers=0))
-        client_eval_loaders.append(DataLoader(ds_c,  batch_size=64, shuffle=False, num_workers=0))
+        client_eval_loaders.append(DataLoader(ds_c_eval, batch_size=32, shuffle=False, num_workers=0))
 
     # ---------- Modelos ----------
     base = SmallCNN().to(DEVICE)
 
-    model_rand = copy.deepcopy(base).to(DEVICE)
-    rng_rand_sel = random.Random(SEED + 424242)
-    start_phase("random", 1, sorted(list(attacked_set)))
+    if run_random:
+        model_rand   = copy.deepcopy(base).to(DEVICE)
+        rng_rand_sel = random.Random(SEED + 424242)
+        start_phase("random", 1, sorted(list(attacked_set)))
 
-    model_vdn = copy.deepcopy(base).to(DEVICE)
-    staleness_v = np.zeros(n_clients, dtype=np.float32)
-    streak_v    = np.zeros(n_clients, dtype=np.int32)
-    loss_hist_v: List[float] = []
-    pending_v: Optional[Tuple] = None
-    mom_v: Optional[torch.Tensor] = None
+    if run_vdn:
+        model_vdn   = copy.deepcopy(base).to(DEVICE)
+        staleness_v = np.zeros(n_clients, dtype=np.float32)
+        streak_v    = np.zeros(n_clients, dtype=np.int32)
+        loss_hist_v: List[float] = []
+        pending_v:   Optional[Tuple] = None
+        mom_v:       Optional[torch.Tensor] = None
 
-    agent_v = VDNSelector(
-        n_agents=n_clients, d_in=5, k_select=k_select, hidden=marl_hidden,
-        lr=marl_lr, weight_decay=1e-4, gamma=marl_gamma, grad_clip=1.0,
-        target_sync_every=marl_target_sync_every, buf_size=buf_size,
-        batch_size=batch_base, train_steps=max(1, updates_per_round),
-        per_alpha=per_alpha, per_beta_start=per_beta_start,
-        per_beta_end=per_beta_end, per_beta_steps=per_beta_steps,
-        per_eps=per_eps, double_dqn=True, seed=SEED + 10,
-    )
-    start_phase("vdn", 1, sorted(list(attacked_set)))
+        agent_v = VDNSelector(
+            n_agents=n_clients, d_in=5, k_select=k_select, hidden=marl_hidden,
+            lr=marl_lr, weight_decay=1e-4, gamma=marl_gamma, grad_clip=1.0,
+            target_sync_every=marl_target_sync_every, buf_size=buf_size,
+            batch_size=batch_base, train_steps=max(1, updates_per_round),
+            per_alpha=per_alpha, per_beta_start=per_beta_start,
+            per_beta_end=per_beta_end, per_beta_steps=per_beta_steps,
+            per_eps=per_eps, double_dqn=True, seed=SEED + 10,
+        )
+        start_phase("vdn", 1, sorted(list(attacked_set)))
 
+    epochs_or_steps_str = f"local_epochs={local_epochs}" if local_epochs is not None else f"local_steps={local_steps}"
     print(f"\nDEVICE={DEVICE} | N_CLIENTS={n_clients} | K={k_select} | rounds={rounds}")
-    print(f"dir_alpha={dir_alpha} | attacked_init={n_init} | local_steps={local_steps}")
+    print(f"dir_alpha={dir_alpha} | attacked_init={n_init} | {epochs_or_steps_str}")
+    print(f"run_random={run_random} | run_vdn={run_vdn}")
     print(f"Avg client size ~ {np.mean(client_sizes):.1f} samples\n")
 
     try:
@@ -241,8 +280,9 @@ def run_experiment(
                 for cid in add_now:
                     attacked_set.add(cid)
                     attack_rate_per_client[cid] = float(flip_rate_new_attack)
-                for cid, ds in enumerate(switchable_ds):
-                    ds.set_attack(cid in attacked_set, float(attack_rate_per_client[cid]))
+                for cid in range(n_clients):
+                    switchable_ds[cid].set_attack(cid in attacked_set, float(attack_rate_per_client[cid]))
+                    switchable_ds_eval[cid].set_attack(cid in attacked_set, float(attack_rate_per_client[cid]))
                 log["attack_schedule"].append({
                     "round": int(t), "added_clients": list(map(int, add_now)),
                     "rate_for_added": float(flip_rate_new_attack),
@@ -256,89 +296,100 @@ def run_experiment(
             # ============================================================
             # TRACK A: RANDOM
             # ============================================================
-            a_rand = eval_acc(model_rand, test_loader, max_batches=80)
+            if run_random:
+                a_rand = eval_acc(model_rand, test_loader, max_batches=80)
 
-            deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
-                model_rand, client_train_loaders, client_eval_loaders, val_loader,
-                local_lr, local_steps, probe_batches=probe_batches,
-                mom=None, mom_beta=mom_beta, round_seed=round_seed + 1,
-            )
+                deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
+                    model_rand, client_train_loaders, client_eval_loaders, val_loader,
+                    local_lr, local_steps, probe_batches=probe_batches,
+                    mom=None, mom_beta=mom_beta, round_seed=round_seed + 1,
+                    local_epochs=local_epochs,
+                )
 
-            K = min(k_select, n_clients)
-            sel_r = rng_rand_sel.sample(range(n_clients), K)
-            apply_fedavg(model_rand, deltas_r, sel_r)
-            bump("random", sel_r)
-            log["tracks"]["random"]["test_acc"].append(float(a_rand))
+                K = min(k_select, n_clients)
+                sel_r = rng_rand_sel.sample(range(n_clients), K)
+                apply_fedavg(model_rand, deltas_r, sel_r)
+                bump("random", sel_r)
+                log["tracks"]["random"]["test_acc"].append(float(a_rand))
 
             # ============================================================
             # TRACK B: VDN
             # ============================================================
-            acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
-            _l_before = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
+            if run_vdn:
+                acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
+                _l_before = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
 
-            deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
-                model_vdn, client_train_loaders, client_eval_loaders, val_loader,
-                local_lr, local_steps, probe_batches=probe_batches,
-                mom=mom_v, mom_beta=mom_beta, round_seed=round_seed + 2,
-            )
+                deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
+                    model_vdn, client_train_loaders, client_eval_loaders, val_loader,
+                    local_lr, local_steps, probe_batches=probe_batches,
+                    mom=mom_v, mom_beta=mom_beta, round_seed=round_seed + 2,
+                    local_epochs=local_epochs,
+                )
 
-            obs_v = build_context_matrix_vdn(proj_mom_v, probe_now_v, staleness_v, streak_v)
+                obs_v = build_context_matrix_vdn(proj_mom_v, probe_now_v, staleness_v, streak_v)
 
-            if pending_v is not None:
-                o_prev, a_prev, r_prev = pending_v
-                agent_v.add_transition(obs=o_prev, act=a_prev, r=r_prev, obs2=obs_v, done=False)
+                if pending_v is not None:
+                    o_prev, a_prev, r_prev = pending_v
+                    agent_v.add_transition(obs=o_prev, act=a_prev, r=r_prev, obs2=obs_v, done=False)
 
-            force_rand = (agent_v.buf.n < warmup_transitions)
-            act_v, sel_v = agent_v.select_topk_actions(
-                obs=obs_v, eps=marl_eps, swap_m=marl_swap_m, force_random=force_rand
-            )
+                force_rand = (agent_v.buf.n < warmup_transitions)
+                act_v, sel_v = agent_v.select_topk_actions(
+                    obs=obs_v, eps=marl_eps, swap_m=marl_swap_m, force_random=force_rand
+                )
 
-            # Debug: estados dos selecionados
-            q_all = agent_v.q_values(obs_v)
-            print("\n[SELECTED DEBUG] cid | flag | state | Q0 Q1")
-            for cid in sel_v:
-                flag = "ATTACKER" if cid in attacked_set else "HONEST"
-                st = obs_v[cid]
-                q0, q1 = float(q_all[cid, 0]), float(q_all[cid, 1])
-                print(f"  {cid:02d} | {flag:8s} | [{st[0]:.3f}, {st[1]:+.4f}, {st[2]:.4f}, "
-                      f"{st[3]:.3f}, {st[4]:.3f}] | {q0:+.4f} {q1:+.4f}")
-            print("")
-
-            # Adv / FO periódico
-            if print_advfo_every and t % print_advfo_every == 0:
-                adv = (q_all[:, 1] - q_all[:, 0]).astype(np.float32)
-                order = np.argsort(-adv)
-                print(f"[ADV/FO @ {t}] cid | flag | adv | FO")
-                for cid in order.tolist():
+                # Debug: estados dos selecionados
+                q_all = agent_v.q_values(obs_v)
+                print("\n[SELECTED DEBUG] cid | flag | state | Q0 Q1")
+                for cid in sel_v:
                     flag = "ATTACKER" if cid in attacked_set else "HONEST"
-                    print(f"  {cid:02d} | {flag:8s} | adv={adv[cid]:+.6f} | FO={float(fo_v[cid]):+.6f}")
+                    st = obs_v[cid]
+                    q0, q1 = float(q_all[cid, 0]), float(q_all[cid, 1])
+                    print(f"  {cid:02d} | {flag:8s} | [{st[0]:.3f}, {st[1]:+.4f}, {st[2]:.4f}, "
+                          f"{st[3]:.3f}, {st[4]:.3f}] | {q0:+.4f} {q1:+.4f}")
                 print("")
 
-            apply_fedavg(model_vdn, deltas_v, sel_v)
-            update_staleness_streak(staleness_v, streak_v, sel_v)
+                # Adv / FO periódico
+                if print_advfo_every and t % print_advfo_every == 0:
+                    adv = (q_all[:, 1] - q_all[:, 0]).astype(np.float32)
+                    order = np.argsort(-adv)
+                    print(f"[ADV/FO @ {t}] cid | flag | adv | FO")
+                    for cid in order.tolist():
+                        flag = "ATTACKER" if cid in attacked_set else "HONEST"
+                        print(f"  {cid:02d} | {flag:8s} | adv={adv[cid]:+.6f} | FO={float(fo_v[cid]):+.6f}")
+                    print("")
 
-            l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
-            loss_hist_v.append(l_after)
-            r_v = windowed_reward(loss_hist_v[:-1], l_after, W=reward_window_W)
-            pending_v = (obs_v.copy(), act_v.copy(), float(r_v))
+                apply_fedavg(model_vdn, deltas_v, sel_v)
+                update_staleness_streak(staleness_v, streak_v, sel_v)
 
-            trained = False
-            if (t >= start_train_round) and (t % train_every == 0) and (agent_v.buf.n >= batch_base) and not force_rand:
-                bs = dynamic_batch_size(agent_v.buf.n, base=batch_base, max_bs=batch_max, ratio=batch_buffer_ratio)
-                agent_v.train(batch_size=bs, train_steps=updates_per_round)
-                trained = True
+                l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
+                loss_hist_v.append(l_after)
+                r_v = windowed_reward(loss_hist_v[:-1], l_after, W=reward_window_W)
+                pending_v = (obs_v.copy(), act_v.copy(), float(r_v))
 
-            bump("vdn", sel_v)
-            log["tracks"]["vdn"]["test_acc"].append(float(acc_v))
+                trained = False
+                if (t >= start_train_round) and (t % train_every == 0) and (agent_v.buf.n >= batch_base) and not force_rand:
+                    bs = dynamic_batch_size(agent_v.buf.n, base=batch_base, max_bs=batch_max, ratio=batch_buffer_ratio)
+                    agent_v.train(batch_size=bs, train_steps=updates_per_round)
+                    trained = True
 
+                bump("vdn", sel_v)
+                log["tracks"]["vdn"]["test_acc"].append(float(acc_v))
+
+            # ============================================================
+            # PRINT SUMMARY
+            # ============================================================
             if t % print_every == 0:
+                rand_str    = f"RANDOM={a_rand*100:.2f}%"  if run_random else "RANDOM=OFF"
+                vdn_str     = f"VDN={acc_v*100:.2f}%"      if run_vdn   else "VDN=OFF"
+                buf_str     = f"buf={agent_v.buf.n}"        if run_vdn   else ""
+                trained_str = f"trained={int(trained)}"     if run_vdn   else ""
                 print(
-                    f"[summary @ {t:3d}] RANDOM={a_rand*100:.2f}% | VDN={acc_v*100:.2f}% | "
-                    f"attacked={len(attacked_set)} | buf={agent_v.buf.n} | trained={int(trained)}",
+                    f"[summary @ {t:3d}] {rand_str} | {vdn_str} | "
+                    f"attacked={len(attacked_set)} | {buf_str} | {trained_str}",
                     flush=True,
                 )
 
-        if pending_v is not None:
+        if run_vdn and pending_v is not None:
             o_prev, a_prev, r_prev = pending_v
             agent_v.add_transition(obs=o_prev, act=a_prev, r=r_prev, obs2=o_prev, done=True)
 
@@ -346,3 +397,4 @@ def run_experiment(
 
     finally:
         save_json()
+
