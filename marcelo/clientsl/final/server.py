@@ -44,17 +44,23 @@ def server_reference_grad(
 
 
 # ============================
-# Local training (fixed steps)
+# Local training — steps curtos (para métricas)
 # ============================
 def local_train_delta(
     global_model: nn.Module,
     train_loader: DataLoader,
-    lr: float = 0.01,
+    lr: float = 0.005,
     steps: int = 10,
+    momentum: float = 0.95,
+    weight_decay: float = 1e-4,
+    nesterov: bool = True,
 ) -> torch.Tensor:
     model = copy.deepcopy(global_model).to(DEVICE)
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    opt = torch.optim.SGD(
+        model.parameters(), lr=lr, momentum=momentum,
+        weight_decay=weight_decay, nesterov=(nesterov and momentum > 0.0),
+    )
     w0 = flatten_params(model).clone()
 
     it = iter(train_loader)
@@ -75,7 +81,48 @@ def local_train_delta(
 
 
 # ============================
-# Compute deltas + projections + probing
+# Local training — epochs completos (para FedAvg)
+# ============================
+def local_train_selected(
+    global_model: nn.Module,
+    client_train_loaders: List[DataLoader],
+    selected: List[int],
+    lr: float = 0.005,
+    epochs: int = 5,
+    momentum: float = 0.95,
+    weight_decay: float = 1e-4,
+    nesterov: bool = True,
+) -> List[Tuple[int, torch.Tensor]]:
+    """
+    Treina apenas os clientes selecionados com epochs completos.
+    Retorna lista de (cid, delta) para usar no apply_fedavg.
+    """
+    results = []
+    for cid in selected:
+        model = copy.deepcopy(global_model).to(DEVICE)
+        model.train()
+        opt = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=momentum,
+            weight_decay=weight_decay, nesterov=(nesterov and momentum > 0.0),
+        )
+        w0 = flatten_params(model).clone()
+
+        for _ in range(epochs):
+            for x, y in client_train_loaders[cid]:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                opt.zero_grad()
+                loss = F.cross_entropy(model(x), y)
+                loss.backward()
+                opt.step()
+
+        w1 = flatten_params(model)
+        results.append((cid, (w1 - w0).detach()))
+
+    return results
+
+
+# ============================
+# Compute deltas + projections + probing (usa steps curtos)
 # ============================
 def compute_deltas_proj_mom_probe_now_and_fo(
     model: nn.Module,
@@ -88,6 +135,9 @@ def compute_deltas_proj_mom_probe_now_and_fo(
     mom: Optional[torch.Tensor] = None,
     mom_beta: float = 0.90,
     round_seed: int = 0,
+    momentum: float = 0.95,
+    weight_decay: float = 1e-4,
+    nesterov: bool = True,
 ) -> Tuple[List[torch.Tensor], np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     gref = server_reference_grad(model, val_loader, batches=10)
 
@@ -113,7 +163,10 @@ def compute_deltas_proj_mom_probe_now_and_fo(
             float(probing_loss_random_offset(model, ev_loader, batches=probe_batches, rng=rng_i))
         )
 
-        dw = local_train_delta(model, tr_loader, lr=local_lr, steps=local_steps)
+        dw = local_train_delta(
+            model, tr_loader, lr=local_lr, steps=local_steps,
+            momentum=momentum, weight_decay=weight_decay, nesterov=nesterov,
+        )
         deltas.append(dw)
 
         proj_mom.append(float(torch.dot(dw, desc_mom_norm).item()))
@@ -131,12 +184,76 @@ def compute_deltas_proj_mom_probe_now_and_fo(
 # ============================
 # FedAvg aggregation
 # ============================
+# def apply_fedavg(
+#     model: nn.Module,
+#     deltas: List[Tuple[int, torch.Tensor]],
+#     selected: List[int],
+# ) -> None:
+#     """
+#     Aceita tanto lista de tensores (deltas de todos os clientes, indexada por cid)
+#     quanto lista de tuplas (cid, delta) retornada por local_train_selected.
+#     """
+#     w = flatten_params(model).clone()
+# 
+#     # detecta formato: lista de tuplas (cid, delta) ou lista de tensores
+#     if deltas and isinstance(deltas[0], tuple):
+#         tensors = [d for _, d in deltas]
+#     else:
+#         tensors = [deltas[i] for i in selected]
+# 
+#     avg_dw = torch.stack(tensors, dim=0).mean(dim=0)
+#     load_flat_params_(model, w + avg_dw)
+# 
+
+
+
 def apply_fedavg(
-    model: nn.Module, deltas: List[torch.Tensor], selected: List[int]
+    model: nn.Module,
+    deltas: List[Tuple[int, torch.Tensor]],
+    selected: List[int],
 ) -> None:
     w = flatten_params(model).clone()
-    avg_dw = torch.stack([deltas[i] for i in selected], dim=0).mean(dim=0)
+
+    if deltas and isinstance(deltas[0], tuple):
+        tensors = [d for _, d in deltas]
+    else:
+        tensors = [deltas[i] for i in selected]
+
+    # norm filtering — descarta deltas com norma > 2x a mediana
+    norms = np.array([d.norm().item() for d in tensors])
+    median_norm = np.median(norms)
+    tensors = [d for d, n in zip(tensors, norms) if n < 2.0 * median_norm]
+
+    if len(tensors) == 0:
+        return  # segurança: se filtrou tudo, não atualiza
+
+    avg_dw = torch.stack(tensors, dim=0).median(dim=0).values
+    # clipping do delta agregado final
+    max_norm = median_norm * 0.1
+    avg_norm = avg_dw.norm().item()
+    if avg_norm > max_norm:
+        avg_dw = avg_dw * (max_norm / avg_norm)
     load_flat_params_(model, w + avg_dw)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================
