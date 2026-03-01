@@ -2,12 +2,12 @@ from experiment import run_experiment
 
 if __name__ == "__main__":
     run_experiment(
-        rounds=500,
+        rounds=350,
         n_clients=50,
         k_select=15,
         dir_alpha=0.3,
-        run_random=False,
-        run_vdn=True,
+        run_random=True,
+        run_vdn=False,
         initial_flip_fraction=0.4,
         flip_add_fraction=0.0,
         attack_rounds=[600],
@@ -28,7 +28,7 @@ if __name__ == "__main__":
 
         marl_eps=0.15,
         marl_swap_m=2,
-        marl_lr=1e-3,
+        marl_lr=1e-4,
         marl_gamma=0.90,
         marl_hidden=128,
         marl_target_sync_every=20,

@@ -20,6 +20,7 @@ from data import (
 from metrics import eval_acc, eval_loss, gini_coefficient, windowed_reward, dynamic_batch_size
 from server import (
     compute_deltas_proj_mom_probe_now_and_fo,
+    local_train_selected,
     apply_fedavg,
     update_staleness_streak,
 )
@@ -42,12 +43,16 @@ def run_experiment(
     # Treino
     max_per_client: int = 2500,
     local_lr: float = 0.005,
-    local_steps: int = 10,
-    local_epochs: int = None,    # se passado, sobrescreve local_steps
-    run_random: bool = True,     # toggle track RANDOM
-    run_vdn: bool = True,        # toggle track VDN
+    local_steps: int = 10,        # usado nas métricas (todos os 50 clientes)
+    local_epochs: int = 5,        # usado no FedAvg (só os K selecionados)
+    run_random: bool = True,
+    run_vdn: bool = True,
     probe_batches: int = 5,
     mom_beta: float = 0.90,
+    # SGD
+    momentum: float = 0.95,
+    weight_decay: float = 1e-4,
+    nesterov: bool = True,
     # RL
     reward_window_W: int = 5,
     marl_eps: float = 0.15,
@@ -116,8 +121,8 @@ def run_experiment(
             "start_train_round": int(start_train_round),
             "updates_per_round": int(updates_per_round), "train_every": int(train_every),
             "print_advfo_every": int(print_advfo_every),
-            "local_epochs": local_epochs,
             "local_steps": local_steps,
+            "local_epochs": local_epochs,
             "run_random": run_random,
             "run_vdn": run_vdn,
         },
@@ -260,9 +265,8 @@ def run_experiment(
         )
         start_phase("vdn", 1, sorted(list(attacked_set)))
 
-    epochs_or_steps_str = f"local_epochs={local_epochs}" if local_epochs is not None else f"local_steps={local_steps}"
     print(f"\nDEVICE={DEVICE} | N_CLIENTS={n_clients} | K={k_select} | rounds={rounds}")
-    print(f"dir_alpha={dir_alpha} | attacked_init={n_init} | {epochs_or_steps_str}")
+    print(f"dir_alpha={dir_alpha} | attacked_init={n_init} | local_steps={local_steps}(metrics) epochs={local_epochs}(fedavg)")
     print(f"run_random={run_random} | run_vdn={run_vdn}")
     print(f"Avg client size ~ {np.mean(client_sizes):.1f} samples\n")
 
@@ -299,16 +303,24 @@ def run_experiment(
             if run_random:
                 a_rand = eval_acc(model_rand, test_loader, max_batches=80)
 
+                # métricas com steps (rápido, todos os clientes)
                 deltas_r, _, _, _, _ = compute_deltas_proj_mom_probe_now_and_fo(
                     model_rand, client_train_loaders, client_eval_loaders, val_loader,
                     local_lr, local_steps, probe_batches=probe_batches,
                     mom=None, mom_beta=mom_beta, round_seed=round_seed + 1,
-                    local_epochs=local_epochs,
+                    momentum=momentum, weight_decay=weight_decay, nesterov=nesterov,
                 )
 
                 K = min(k_select, n_clients)
                 sel_r = rng_rand_sel.sample(range(n_clients), K)
-                apply_fedavg(model_rand, deltas_r, sel_r)
+
+                # FedAvg com epochs completos (só os selecionados)
+                deltas_r_full = local_train_selected(
+                    model_rand, client_train_loaders, sel_r,
+                    lr=local_lr, epochs=local_epochs,
+                    momentum=momentum, weight_decay=weight_decay, nesterov=nesterov,
+                )
+                apply_fedavg(model_rand, deltas_r_full, sel_r)
                 bump("random", sel_r)
                 log["tracks"]["random"]["test_acc"].append(float(a_rand))
 
@@ -319,11 +331,12 @@ def run_experiment(
                 acc_v = eval_acc(model_vdn, test_loader, max_batches=80)
                 _l_before = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
 
+                # métricas com steps (rápido, todos os clientes)
                 deltas_v, proj_mom_v, probe_now_v, fo_v, mom_v = compute_deltas_proj_mom_probe_now_and_fo(
                     model_vdn, client_train_loaders, client_eval_loaders, val_loader,
                     local_lr, local_steps, probe_batches=probe_batches,
                     mom=mom_v, mom_beta=mom_beta, round_seed=round_seed + 2,
-                    local_epochs=local_epochs,
+                    momentum=momentum, weight_decay=weight_decay, nesterov=nesterov,
                 )
 
                 obs_v = build_context_matrix_vdn(proj_mom_v, probe_now_v, staleness_v, streak_v)
@@ -337,7 +350,6 @@ def run_experiment(
                     obs=obs_v, eps=marl_eps, swap_m=marl_swap_m, force_random=force_rand
                 )
 
-                # Debug: estados dos selecionados
                 q_all = agent_v.q_values(obs_v)
                 print("\n[SELECTED DEBUG] cid | flag | state | Q0 Q1")
                 for cid in sel_v:
@@ -348,7 +360,6 @@ def run_experiment(
                           f"{st[3]:.3f}, {st[4]:.3f}] | {q0:+.4f} {q1:+.4f}")
                 print("")
 
-                # Adv / FO periódico
                 if print_advfo_every and t % print_advfo_every == 0:
                     adv = (q_all[:, 1] - q_all[:, 0]).astype(np.float32)
                     order = np.argsort(-adv)
@@ -358,7 +369,13 @@ def run_experiment(
                         print(f"  {cid:02d} | {flag:8s} | adv={adv[cid]:+.6f} | FO={float(fo_v[cid]):+.6f}")
                     print("")
 
-                apply_fedavg(model_vdn, deltas_v, sel_v)
+                # FedAvg com epochs completos (só os selecionados)
+                deltas_v_full = local_train_selected(
+                    model_vdn, client_train_loaders, sel_v,
+                    lr=local_lr, epochs=local_epochs,
+                    momentum=momentum, weight_decay=weight_decay, nesterov=nesterov,
+                )
+                apply_fedavg(model_vdn, deltas_v_full, sel_v)
                 update_staleness_streak(staleness_v, streak_v, sel_v)
 
                 l_after = eval_loss(model_vdn, val_loader, max_batches=eval_max_batches)
@@ -379,10 +396,10 @@ def run_experiment(
             # PRINT SUMMARY
             # ============================================================
             if t % print_every == 0:
-                rand_str    = f"RANDOM={a_rand*100:.2f}%"  if run_random else "RANDOM=OFF"
-                vdn_str     = f"VDN={acc_v*100:.2f}%"      if run_vdn   else "VDN=OFF"
-                buf_str     = f"buf={agent_v.buf.n}"        if run_vdn   else ""
-                trained_str = f"trained={int(trained)}"     if run_vdn   else ""
+                rand_str    = f"RANDOM={a_rand*100:.2f}%" if run_random else "RANDOM=OFF"
+                vdn_str     = f"VDN={acc_v*100:.2f}%"    if run_vdn   else "VDN=OFF"
+                buf_str     = f"buf={agent_v.buf.n}"      if run_vdn   else ""
+                trained_str = f"trained={int(trained)}"   if run_vdn   else ""
                 print(
                     f"[summary @ {t:3d}] {rand_str} | {vdn_str} | "
                     f"attacked={len(attacked_set)} | {buf_str} | {trained_str}",
@@ -397,4 +414,3 @@ def run_experiment(
 
     finally:
         save_json()
-
